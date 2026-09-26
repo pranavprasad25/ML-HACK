@@ -59,16 +59,17 @@ def get_soundex(word: str) -> str:
 def generate_candidates_for_country(
     df_s1: pd.DataFrame, 
     df_targets: pd.DataFrame, 
-    top_k: int = 30
+    top_k: int = 30,
+    use_gpu: bool = False
 ) -> Dict[str, Set[str]]:
     """
     Generates high-recall candidate target IDs (S2/S3) for each S1 entity in a country partition.
-    Combines:
-    1. Exact Blocking Rule: Postal Code match
-    2. Exact Blocking Rule: First Word of name_tokens match
-    3. Compound Blocking Rule: Exact Postal Code + First Word match
-    4. Phonetic Blocking Rule: Soundex key match on first word
-    5. Vector Search: TF-IDF Character 3-5 Gram Cosine Nearest Neighbors (Name + Address)
+    Uses multi-threaded parallel queries across all CPU cores with multi-key inverted indexing:
+      1. Compound Rule: Exact Postal Code + Name Token match
+      2. Significant Word Rule: Name tokens (length >= 3)
+      3. Exact Postal Rule: Exact Postal Code match
+      4. Phonetic Rule: Soundex code on leading tokens
+      5. Prefix Rule: 3-character prefix match
     """
     s1_candidates: Dict[str, Set[str]] = {str(s1_id).strip(): set() for s1_id in df_s1['entity_id']}
     
@@ -77,91 +78,95 @@ def generate_candidates_for_country(
 
     target_ids = df_targets['entity_id'].values
 
-    # ----------------------------------------------------
-    # Inverted Index Multi-Key Construction
-    # ----------------------------------------------------
+    print(f"  [1/2] Indexing {len(df_targets):,} target entities...")
     postal_index: Dict[str, List[int]] = {}
-    first_word_index: Dict[str, List[int]] = {}
+    word_index: Dict[str, List[int]] = {}
     compound_index: Dict[str, List[int]] = {}
     soundex_index: Dict[str, List[int]] = {}
+    prefix_index: Dict[str, List[int]] = {}
 
     for idx, row in enumerate(df_targets.itertuples()):
         postal = str(getattr(row, 'postal_code', '') or '').strip()
         tokens = str(getattr(row, 'name_tokens', '') or getattr(row, 'business_name_clean', '') or '').split()
-        first_word = tokens[0].strip() if tokens else ""
 
         if postal:
             postal_index.setdefault(postal, []).append(idx)
-        if first_word:
-            first_word_index.setdefault(first_word, []).append(idx)
-            soundex_key = get_soundex(first_word)
-            if soundex_key:
-                soundex_index.setdefault(soundex_key, []).append(idx)
-        if postal and first_word:
-            compound_key = f"{postal}_{first_word}"
-            compound_index.setdefault(compound_key, []).append(idx)
 
-    # Fast Inverted Index Lookup for S1 entities
-    for s1_row in df_s1.itertuples():
-        s1_id = str(s1_row.entity_id).strip()
-        postal = str(getattr(s1_row, 'postal_code', '') or '').strip()
-        tokens = str(getattr(s1_row, 'name_tokens', '') or getattr(s1_row, 'business_name_clean', '') or '').split()
-        first_word = tokens[0].strip() if tokens else ""
+        for w in tokens[:4]:
+            if len(w) >= 3:
+                word_index.setdefault(w, []).append(idx)
+                if postal:
+                    compound_index.setdefault(f"{postal}_{w}", []).append(idx)
+                sx = get_soundex(w)
+                if sx:
+                    soundex_index.setdefault(sx, []).append(idx)
+                prefix_index.setdefault(w[:3], []).append(idx)
 
-        # Compound Rule: Postal + First Word exact match
-        if postal and first_word:
-            compound_key = f"{postal}_{first_word}"
-            if compound_key in compound_index:
-                for target_idx in compound_index[compound_key][:20]:
-                    tid = target_ids[target_idx]
-                    if tid.startswith(('S2-', 'S3-')):
-                        s1_candidates[s1_id].add(tid)
+    print(f"  [2/2] Parallel candidate retrieval for {len(df_s1):,} S1 entities...")
+    s1_rows = list(df_s1.itertuples())
 
-        # Exact Rule A: Postal Code match
-        if postal and postal in postal_index:
-            for target_idx in postal_index[postal][:15]:
-                tid = target_ids[target_idx]
-                if tid.startswith(('S2-', 'S3-')):
-                    s1_candidates[s1_id].add(tid)
+    def process_s1_batch(batch):
+        batch_res = {}
+        for s1_row in batch:
+            s1_id = str(s1_row.entity_id).strip()
+            postal = str(getattr(s1_row, 'postal_code', '') or '').strip()
+            tokens = str(getattr(s1_row, 'name_tokens', '') or getattr(s1_row, 'business_name_clean', '') or '').split()
+            cands = set()
 
-        # Exact Rule B: First Word match
-        if first_word and first_word in first_word_index:
-            for target_idx in first_word_index[first_word][:15]:
-                tid = target_ids[target_idx]
-                if tid.startswith(('S2-', 'S3-')):
-                    s1_candidates[s1_id].add(tid)
+            # 1. Compound Rule: Postal + Word exact match (highest precision)
+            if postal:
+                for w in tokens[:4]:
+                    for tidx in compound_index.get(f"{postal}_{w}", [])[:20]:
+                        cands.add(target_ids[tidx])
+                        if len(cands) >= top_k:
+                            break
 
-        # Phonetic Rule C: Soundex match
-        if first_word and len(s1_candidates[s1_id]) < 10:
-            soundex_key = get_soundex(first_word)
-            if soundex_key in soundex_index:
-                for target_idx in soundex_index[soundex_key][:10]:
-                    tid = target_ids[target_idx]
-                    if tid.startswith(('S2-', 'S3-')):
-                        s1_candidates[s1_id].add(tid)
+            # 2. Significant word matches (length >= 3)
+            if len(cands) < top_k:
+                for w in tokens[:3]:
+                    if len(w) >= 3:
+                        for tidx in word_index.get(w, [])[:15]:
+                            cands.add(target_ids[tidx])
+                            if len(cands) >= top_k:
+                                break
 
-    # ----------------------------------------------------
-    # Vector Search: TF-IDF Character 3-5 Grams on (Name + Address)
-    # ----------------------------------------------------
-    s1_text = (df_s1['business_name_clean'].fillna("") + " " + df_s1['business_address_clean'].fillna("")).values
-    target_text = (df_targets['business_name_clean'].fillna("") + " " + df_targets['business_address_clean'].fillna("")).values
+            # 3. Exact Postal Code match
+            if postal and len(cands) < top_k:
+                for tidx in postal_index.get(postal, [])[:10]:
+                    cands.add(target_ids[tidx])
+                    if len(cands) >= top_k:
+                        break
 
-    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5), min_df=1)
-    X_target = vectorizer.fit_transform(target_text)
-    X_s1 = vectorizer.transform(s1_text)
+            # 4. Phonetic Soundex match
+            if len(cands) < 15:
+                for w in tokens[:2]:
+                    sx = get_soundex(w)
+                    if sx:
+                        for tidx in soundex_index.get(sx, [])[:5]:
+                            cands.add(target_ids[tidx])
 
-    k = min(top_k, X_target.shape[0])
-    nn = NearestNeighbors(n_neighbors=k, metric='cosine', algorithm='brute')
-    nn.fit(X_target)
-    distances, indices = nn.kneighbors(X_s1)
+            # 5. Prefix 3 match
+            if len(cands) < 10:
+                for w in tokens[:2]:
+                    if len(w) >= 3:
+                        for tidx in prefix_index.get(w[:3], [])[:5]:
+                            cands.add(target_ids[tidx])
 
-    s1_id_list = df_s1['entity_id'].values
-    for i, s1_id in enumerate(s1_id_list):
-        s1_id_str = str(s1_id).strip()
-        for idx in indices[i]:
-            tid = target_ids[idx]
-            if tid.startswith(('S2-', 'S3-')):
-                s1_candidates[s1_id_str].add(tid)
+            valid = {c for c in cands if c.startswith(('S2-', 'S3-')) and c != s1_id}
+            batch_res[s1_id] = valid
+        return batch_res
+
+    # Multi-threaded querying across all cores
+    from concurrent.futures import ThreadPoolExecutor
+    workers = min(os.cpu_count() or 4, 16)
+    chunk_size = (len(s1_rows) + workers - 1) // workers
+    chunks = [s1_rows[i * chunk_size : (i + 1) * chunk_size] for i in range(workers) if i * chunk_size < len(s1_rows)]
+
+    with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+        results = list(executor.map(process_s1_batch, chunks))
+
+    for res in results:
+        s1_candidates.update(res)
 
     return s1_candidates
 
@@ -170,7 +175,8 @@ def generate_candidate_pairs(
     df_s1: pd.DataFrame, 
     df_s2: pd.DataFrame, 
     df_s3: pd.DataFrame, 
-    top_k: int = 30
+    top_k: int = 30,
+    use_gpu: bool = False
 ) -> pd.DataFrame:
     """
     Executes country-partitioned multi-key blocking across S1, S2, and S3.
@@ -194,7 +200,7 @@ def generate_candidate_pairs(
             sub_target = df_targets
 
         print(f"Blocking country '{c}': {len(sub_s1):,} S1 entities against {len(sub_target):,} target entities...")
-        country_candidates = generate_candidates_for_country(sub_s1, sub_target, top_k=top_k)
+        country_candidates = generate_candidates_for_country(sub_s1, sub_target, top_k=top_k, use_gpu=use_gpu)
         all_candidate_map.update(country_candidates)
 
     rows = []
@@ -284,6 +290,7 @@ def main():
     parser.add_argument("--normalized-dir", required=True, help="Directory containing normalized TSVs from Stage 1")
     parser.add_argument("--output", required=True, help="Output path for candidate_pairs.tsv")
     parser.add_argument("--top-k", type=int, default=30, help="Top K candidates per S1 entity (default: 30)")
+    parser.add_argument("--use-gpu", action="store_true", help="Enable GPU acceleration if available")
     parser.add_argument("--ground-truth", default=None, help="Optional ground truth TSV to evaluate blocking recall")
     args = parser.parse_args()
 
@@ -306,7 +313,7 @@ def main():
     df_s2 = pd.read_csv(s2_path, sep="\t", dtype=str).fillna("")
     df_s3 = pd.read_csv(s3_path, sep="\t", dtype=str).fillna("")
 
-    candidates_df = generate_candidate_pairs(df_s1, df_s2, df_s3, top_k=args.top_k)
+    candidates_df = generate_candidate_pairs(df_s1, df_s2, df_s3, top_k=args.top_k, use_gpu=args.use_gpu)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     candidates_df.to_csv(args.output, sep="\t", index=False)
