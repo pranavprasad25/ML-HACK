@@ -31,15 +31,25 @@ from rapidfuzz.distance import JaroWinkler, Levenshtein
 # ==============================================================================
 # Feature Schema Contract (Strictly ordered for Person 3B consumption)
 # ==============================================================================
+# ==============================================================================
+# Feature Schema Contract (Strictly ordered for Person 3B consumption)
+# ==============================================================================
 FEATURE_NAMES: List[str] = [
     "name_levenshtein_ratio",
     "name_jaro_winkler",
     "name_token_sort_ratio",
     "name_token_set_ratio",
+    "name_partial_ratio",
+    "name_token_jaccard",
+    "name_prefix_3_match",
+    "name_length_diff_ratio",
     "address_levenshtein_ratio",
     "address_jaro_winkler",
     "address_token_sort_ratio",
     "address_token_set_ratio",
+    "address_token_jaccard",
+    "address_digit_overlap",
+    "address_length_diff_ratio",
     "exact_zip_match",
 ]
 
@@ -142,28 +152,9 @@ def _extract_field(rec: Dict[str, Any], candidate_keys: Tuple[str, ...], is_post
 # ==============================================================================
 def extract_features(s1_rec: Dict[str, Any], cand_rec: Dict[str, Any]) -> np.ndarray:
     """
-    Extracts a standardized 1D NumPy array of numerical similarity features
+    Extracts a standardized 1D NumPy array of 16 numerical similarity features
     between a Source 1 record and a candidate record.
-
-    Features generated (in exact order of FEATURE_NAMES):
-      0. name_levenshtein_ratio: RapidFuzz Levenshtein similarity on business names [0.0, 1.0]
-      1. name_jaro_winkler: Jaro-Winkler similarity on business names [0.0, 1.0]
-      2. name_token_sort_ratio: Token sort ratio for business names [0.0, 1.0]
-      3. name_token_set_ratio: Token set ratio for business names [0.0, 1.0]
-      4. address_levenshtein_ratio: RapidFuzz Levenshtein similarity on addresses [0.0, 1.0]
-      5. address_jaro_winkler: Jaro-Winkler similarity on addresses [0.0, 1.0]
-      6. address_token_sort_ratio: Token sort ratio for addresses [0.0, 1.0]
-      7. address_token_set_ratio: Token set ratio for addresses [0.0, 1.0]
-      8. exact_zip_match: Binary match flag for postal/ZIP/PIN codes (1.0 for match, 0.0 otherwise)
-
-    Args:
-        s1_rec: Record dictionary from Source 1 (reference source).
-        cand_rec: Record dictionary from Candidate source (Source 2 or 3).
-
-    Returns:
-        np.ndarray: 1D array of shape (9,) with dtype np.float32.
     """
-    # Pre-allocate zeroed array; missing fields automatically default to 0.0
     feats = np.zeros(NUM_FEATURES, dtype=np.float32)
 
     # 1. Resolve and sanitize input attributes
@@ -182,18 +173,33 @@ def extract_features(s1_rec: Dict[str, Any], cand_rec: Dict[str, Any]) -> np.nda
         feats[1] = JaroWinkler.similarity(name1, name2)
         feats[2] = fuzz.token_sort_ratio(name1, name2) * 0.01
         feats[3] = fuzz.token_set_ratio(name1, name2) * 0.01
+        feats[4] = fuzz.partial_ratio(name1, name2) * 0.01
+        
+        t1, t2 = set(name1.split()), set(name2.split())
+        feats[5] = len(t1 & t2) / max(len(t1 | t2), 1)
+        feats[6] = 1.0 if (len(name1) >= 3 and len(name2) >= 3 and name1[:3] == name2[:3]) else 0.0
+        feats[7] = abs(len(name1) - len(name2)) / max(len(name1), len(name2), 1)
 
     # 3. Text Similarities: Business Address
     if addr1 and addr2:
-        feats[4] = Levenshtein.normalized_similarity(addr1, addr2)
-        feats[5] = JaroWinkler.similarity(addr1, addr2)
-        feats[6] = fuzz.token_sort_ratio(addr1, addr2) * 0.01
-        feats[7] = fuzz.token_set_ratio(addr1, addr2) * 0.01
+        feats[8] = Levenshtein.normalized_similarity(addr1, addr2)
+        feats[9] = JaroWinkler.similarity(addr1, addr2)
+        feats[10] = fuzz.token_sort_ratio(addr1, addr2) * 0.01
+        feats[11] = fuzz.token_set_ratio(addr1, addr2) * 0.01
+        
+        a1, a2 = set(addr1.split()), set(addr2.split())
+        feats[12] = len(a1 & a2) / max(len(a1 | a2), 1)
+        
+        # Digit Overlap (House / Unit numbers)
+        import re
+        d1 = set(re.findall(r'\b\d+\b', addr1))
+        d2 = set(re.findall(r'\b\d+\b', addr2))
+        feats[13] = len(d1 & d2) / max(len(d1 | d2), 1) if (d1 and d2) else 0.0
+        feats[14] = abs(len(addr1) - len(addr2)) / max(len(addr1), len(addr2), 1)
 
     # 4. Geographical Feature: Exact ZIP/PIN match
-    # Strict binary rule: 1.0 if both exist and match, 0.0 if mismatch or either is missing
     if zip1 and zip2 and zip1 == zip2:
-        feats[8] = 1.0
+        feats[15] = 1.0
 
     return feats
 

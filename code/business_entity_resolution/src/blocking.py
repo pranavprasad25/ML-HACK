@@ -168,6 +168,32 @@ def generate_candidates_for_country(
     for res in results:
         s1_candidates.update(res)
 
+    # ----------------------------------------------------
+    # Rule 6: TF-IDF Character 3-5 Gram Cosine Nearest Neighbors (Fuzzy Matching)
+    # ----------------------------------------------------
+    try:
+        s1_text = (df_s1['business_name_clean'].fillna("") + " " + df_s1['business_address_clean'].fillna("")).values
+        target_text = (df_targets['business_name_clean'].fillna("") + " " + df_targets['business_address_clean'].fillna("")).values
+
+        vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5), min_df=1)
+        X_target = vectorizer.fit_transform(target_text)
+        X_s1 = vectorizer.transform(s1_text)
+
+        k = min(top_k, X_target.shape[0])
+        nn = NearestNeighbors(n_neighbors=k, metric='cosine', algorithm='brute')
+        nn.fit(X_target)
+        distances, indices = nn.kneighbors(X_s1)
+
+        s1_id_list = df_s1['entity_id'].values
+        for i, s1_id in enumerate(s1_id_list):
+            s1_id_str = str(s1_id).strip()
+            for idx in indices[i]:
+                tid = target_ids[idx]
+                if tid.startswith(('S2-', 'S3-')) and tid != s1_id_str:
+                    s1_candidates[s1_id_str].add(tid)
+    except Exception as e:
+        print(f"  [Warning] TF-IDF NN Vector search fallback: {e}")
+
     return s1_candidates
 
 

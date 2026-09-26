@@ -10,6 +10,7 @@ output/
 output_test/
 data/
 tests/
+models/
 
 # Exclude Python environment & cache
 venv/

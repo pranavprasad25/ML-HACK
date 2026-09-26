@@ -60,20 +60,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # Feature names matching Person 3A's FEATURE_NAMES contract in features.py
 try:
-    from code.business_entity_resolution.src.features import FEATURE_NAMES as P3A_FEATURE_NAMES
+    from features import FEATURE_NAMES as P3A_FEATURE_NAMES
     FEATURE_NAMES = list(P3A_FEATURE_NAMES)
-except Exception:
-    FEATURE_NAMES = [
-        "name_levenshtein_ratio",
-        "name_jaro_winkler",
-        "name_token_sort_ratio",
-        "name_token_set_ratio",
-        "address_levenshtein_ratio",
-        "address_jaro_winkler",
-        "address_token_sort_ratio",
-        "address_token_set_ratio",
-        "exact_zip_match",
-    ]
+except ImportError:
+    try:
+        from .features import FEATURE_NAMES as P3A_FEATURE_NAMES
+        FEATURE_NAMES = list(P3A_FEATURE_NAMES)
+    except ImportError:
+        from code.business_entity_resolution.src.features import FEATURE_NAMES as P3A_FEATURE_NAMES
+        FEATURE_NAMES = list(P3A_FEATURE_NAMES)
 
 DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "models")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "output")
@@ -144,11 +139,11 @@ def mock_extract_features(s1_rec: Any, cand_rec: Any, *args, **kwargs) -> np.nda
     ], dtype=np.float32)
 
 
-def generate_synthetic_training_data(n_samples: int = 10000, n_features: int = 9, positive_ratio: float = 0.1):
+def generate_synthetic_training_data(n_samples: int = 10000, n_features: int = len(FEATURE_NAMES), positive_ratio: float = 0.1):
     """
     Generates synthetic feature matrix + labels for pipeline development.
-    Positive pairs (label=1): features biased toward high similarity (0.6-1.0)
-    Negative pairs (label=0): features biased toward low similarity (0.0-0.5)
+    Positive pairs (label=1): features biased toward high similarity (0.55-1.0)
+    Negative pairs (label=0): features biased toward low similarity (0.0-0.45)
     """
     rng = np.random.RandomState(42)
     n_pos = int(n_samples * positive_ratio)
@@ -157,13 +152,13 @@ def generate_synthetic_training_data(n_samples: int = 10000, n_features: int = 9
     # Positive pairs: high similarity scores
     X_pos = rng.uniform(0.55, 1.0, size=(n_pos, n_features))
     if n_features >= 9:
-        X_pos[:, 8] = (rng.random(n_pos) > 0.15).astype(float)  # exact_zip_match
+        X_pos[:, -1] = (rng.random(n_pos) > 0.15).astype(float)  # exact_zip_match
     y_pos = np.ones(n_pos, dtype=np.int32)
 
     # Negative pairs: low similarity scores
     X_neg = rng.uniform(0.0, 0.45, size=(n_neg, n_features))
     if n_features >= 9:
-        X_neg[:, 8] = (rng.random(n_neg) > 0.95).astype(float)  # exact_zip_match rarely 1
+        X_neg[:, -1] = (rng.random(n_neg) > 0.95).astype(float)  # exact_zip_match rarely 1
     y_neg = np.zeros(n_neg, dtype=np.int32)
 
     X = np.vstack([X_pos, X_neg]).astype(np.float32)
