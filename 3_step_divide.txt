@@ -1,0 +1,118 @@
+To divide **Stage 3** between two people, we can split the workload into **Feature Engineering (Person 3A)** and **Machine Learning & Inference (Person 3B)**. This is a very natural split in data science pipelines and allows both of you to work concurrently.
+
+Here is the exact implementation plan and breakdown of who handles the GPU workload:
+
+---
+
+### Who has the GPU-Intensive Work?
+**Person 3B (Model Training & Optimization)** has the **GPU-intensive** work. 
+- Training a Gradient Boosted Decision Tree (like XGBoost, LightGBM, or CatBoost) on millions of candidate pairs from a 2.3 GB dataset requires massive parallel computation. 
+- Libraries like XGBoost (`tree_method='gpu_hist'`) and LightGBM (`device='gpu'`) heavily utilize the GPU to accelerate tree building.
+- Person 3A’s work (Feature Engineering) is heavily **CPU-bound**, as string matching algorithms (like Levenshtein distance and token overlap) rely on sequential text processing on the CPU.
+
+---
+
+### The New Division of Labor
+
+#### 👤 Person 3A: Pairwise Feature Engineering (CPU-Heavy)
+**Owned File:** `code/business_entity_resolution/src/features.py`
+
+**Responsibilities:**
+1. **Develop the Feature Extraction Logic:** Write the `extract_features(s1_rec, cand_rec)` function that takes a Source 1 record and a candidate record and returns a dictionary/array of numerical features.
+2. **Text Similarity Metrics:** Use `rapidfuzz` to calculate Levenshtein ratio, Jaro-Winkler, Token Sort Ratio, and Token Set Ratio on business names and addresses.
+3. **Geographical Features:** Create binary flags for exact PIN/ZIP code matches or mismatches.
+4. **Output Contract:** Ensure your function returns a clean, standardized vector (e.g., a Pandas Series or NumPy array) that Person 3B can directly plug into their model.
+
+---
+
+#### 👤 Person 3B: Model Training & Threshold Optimization (GPU-Intensive)
+**Owned File:** `code/business_entity_resolution/src/train_predict.py`
+
+**Responsibilities:**
+1. **Dataset Construction:** Write a script that iterates through the training candidate pairs, calls Person 3A's `extract_features` function, and assigns a label (`1` if the pair is in the ground truth, `0` otherwise) to build the `X_train` and `y_train` matrices.
+2. **GPU Model Training:** Initialize and train an XGBoost or LightGBM classifier using GPU acceleration. You will train on the features engineered by Person 3A.
+3. **Threshold Optimization (Crucial):** Run predictions on a validation set and test probability thresholds (e.g., `0.50` to `0.95`). Write a loop that calculates the **Macro $F_{0.5}$** score at each threshold, and save the threshold that produces the highest score.
+4. **Final Inference & Submission:** Load the test candidates, run your model, apply the optimized threshold, and generate the final `output/matching_results.tsv` file adhering to the subset constraint.
+
+---
+
+### How You Will Collaborate in GitHub
+
+Even though you are splitting Stage 3, you **still will not have Git conflicts** because you are working in separate files. 
+
+1. **Person 3A** creates branch: `git checkout -b feature/engineering` and modifies only `features.py`.
+2. **Person 3B** creates branch: `git checkout -b feature/model-training` and modifies only `train_predict.py`.
+
+*Note for Person 3B:* While Person 3A is still writing the complex string matching logic, you don't have to wait! You can temporarily mock the `extract_features` function to return random numbers or just one basic feature (like exact name match) so you can start writing your XGBoost training loop, threshold optimizer, and TSV output generator on Day 1. Once Person 3A merges their real feature code, your model will simply start learning from the real features!
+To allow Person 3A and Person 3B to work and test completely independently, you must establish a strict **Interface Contract** between `features.py` and `train_predict.py`. 
+
+By agreeing on these "Global Rules" on Day 1, neither of you will be blocked waiting for the other.
+
+---
+
+### Global Rule 1: The Function Signature Contract
+Both of you must agree on exactly what the feature extraction function takes in and what it spits out. 
+
+**The Contract:**
+```python
+# In code/business_entity_resolution/src/features.py
+
+from typing import Dict
+
+def extract_features(s1_rec: Dict[str, str], cand_rec: Dict[str, str]) -> Dict[str, float]:
+    """
+    Inputs: 
+       s1_rec, cand_rec: Dictionaries representing a single normalized record from Stage 1.
+                         Keys guaranteed to exist: 'entity_id', 'business_name_clean', 
+                         'business_address_clean', 'country', 'postal_code', 'name_tokens'.
+    
+    Output:
+       A dictionary where keys are the exact feature names (strings) and values are floats.
+    """
+    pass
+```
+
+### Global Rule 2: Handling Nulls & Missing Data (Person 3A)
+Person 3A must guarantee that `extract_features` **never throws an exception**. 
+- The dataset is noisy. Sometimes `business_address_clean` will be an empty string, or `name_tokens` will be empty.
+- **Rule:** If a field is missing, Person 3A's code must catch it and return a default value (like `0.0` or `-1.0`). Person 3B's ML model (XGBoost/LightGBM) will handle these numeric defaults perfectly, but a Python `KeyError` or `TypeError` will crash a 4-hour training run.
+
+### Global Rule 3: The "Mock" Implementation (Person 3B)
+Person 3B cannot wait for Person 3A to finish writing complex RapidFuzz logic. To test `train_predict.py` independently, Person 3B should write a "Dummy" feature extractor at the top of their file on Day 1:
+
+**What Person 3B uses to test:**
+```python
+# In code/business_entity_resolution/src/train_predict.py
+
+def mock_extract_features(s1_rec, cand_rec):
+    """Dummy feature extractor for Person 3B to test model pipelines immediately."""
+    import random
+    return {
+        "name_levenshtein": random.uniform(0, 1),
+        "address_jaccard": random.uniform(0, 1),
+        "exact_pin_match": float(s1_rec.get("postal_code", "A") == cand_rec.get("postal_code", "B"))
+    }
+```
+*Why this works:* Person 3B can build the entire massive `X_train` matrix, feed it to the GPU, train XGBoost, optimize the $F_{0.5}$ threshold, and output the final TSV using this dummy data. Once Person 3A merges the real `features.py` into GitHub, Person 3B just swaps `mock_extract_features` for `from features import extract_features`, and the model suddenly becomes highly accurate!
+
+### Global Rule 4: How to Test Individually
+
+**For Person 3A (Testing Features):**
+Person 3A tests their code by taking two fake dictionaries and printing the output. 
+```bash
+# Person 3A runs a simple test block at the bottom of features.py:
+if __name__ == "__main__":
+    test_s1 = {"name": "amazon limited", "postal_code": "560001", "address": "mg road"}
+    test_cand = {"name": "amazon pvt ltd", "postal_code": "560001", "address": "m.g. road"}
+    print(extract_features(test_s1, test_cand)) 
+    # Must print: {'name_levenshtein': 0.85, 'address_jaccard': 0.7, 'exact_pin_match': 1.0}
+```
+
+**For Person 3B (Testing ML Pipeline):**
+Person 3B tests their code against the small local sample files (`tests/data/`) to ensure the XGBoost loop, threshold optimization, and Pandas logic work without memory leaks.
+```bash
+python code/business_entity_resolution/src/train_predict.py \
+    --candidate-file tests/data/blocking/candidate_pairs_sample.tsv \
+    --normalized-dir tests/data/normalized \
+    --ground-truth tests/data/raw/train_ground_truth_sample.tsv
+```
