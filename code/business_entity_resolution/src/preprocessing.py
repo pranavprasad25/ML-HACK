@@ -363,4 +363,3 @@ if __name__ == '__main__':
         process_directory(args.input_dir, args.output_dir)
     else:
         parser.print_help()
-
