@@ -11,7 +11,7 @@ import os
 import re
 import argparse
 import unicodedata
-from typing import Set, List, Optional
+from typing import Set, List, Optional, Tuple, Any
 import pandas as pd
 from tqdm import tqdm
 
@@ -233,10 +233,23 @@ def extract_name_tokens(clean_name: str) -> str:
 # 3. DATAFRAME BATCH NORMALIZATION
 # ==========================================
 
-def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_chunk(records: List[Tuple[str, str, str, str]]) -> List[Tuple[str, str, str, str, str, str]]:
+    """Worker function for parallel processing across multiple CPU cores."""
+    result = []
+    for eid, name, addr, country in records:
+        cn = clean_business_name(name)
+        ca = clean_address(addr)
+        pc = extract_postal_code(addr, country)
+        toks = extract_name_tokens(cn)
+        result.append((eid, cn, ca, country, pc, toks))
+    return result
+
+
+def normalize_dataframe(df: pd.DataFrame, n_jobs: Optional[int] = None) -> pd.DataFrame:
     """
     Transforms a raw input DataFrame into the standardized Stage 1 schema:
     [entity_id, business_name_clean, business_address_clean, country, postal_code, name_tokens]
+    Uses multi-core parallel processing for large datasets.
     """
     required_cols = {'entity_id', 'business_name', 'business_address', 'country'}
     missing = required_cols - set(df.columns)
@@ -248,31 +261,62 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     addresses = [str(x) if pd.notna(x) else "" for x in df['business_address']]
     countries = [str(x).strip() if pd.notna(x) else "" for x in df['country']]
 
-    clean_names = [clean_business_name(n) for n in names]
-    clean_addrs = [clean_address(a) for a in addresses]
-    postal_codes = [extract_postal_code(a, c) for a, c in zip(addresses, countries)]
-    name_tokens = [extract_name_tokens(cn) for cn in clean_names]
+    n_rows = len(df)
+    # Sequential for small inputs
+    if n_rows < 20000:
+        clean_names = [clean_business_name(n) for n in names]
+        clean_addrs = [clean_address(a) for a in addresses]
+        postal_codes = [extract_postal_code(a, c) for a, c in zip(addresses, countries)]
+        name_tokens = [extract_name_tokens(cn) for cn in clean_names]
+        return pd.DataFrame({
+            'entity_id': entity_ids,
+            'business_name_clean': clean_names,
+            'business_address_clean': clean_addrs,
+            'country': countries,
+            'postal_code': postal_codes,
+            'name_tokens': name_tokens
+        }, dtype=str)
 
-    norm_df = pd.DataFrame({
-        'entity_id': entity_ids,
-        'business_name_clean': clean_names,
-        'business_address_clean': clean_addrs,
-        'country': countries,
-        'postal_code': postal_codes,
-        'name_tokens': name_tokens
-    }, dtype=str)
+    # Multi-core parallel execution for large datasets (e.g. 2M - 5M rows)
+    from concurrent.futures import ProcessPoolExecutor
 
-    return norm_df
+    workers = n_jobs or min(os.cpu_count() or 4, 16)
+    chunk_size = (n_rows + workers - 1) // workers
+    records = list(zip(entity_ids, names, addresses, countries))
+    chunks = [records[i * chunk_size : (i + 1) * chunk_size] for i in range(workers) if i * chunk_size < n_rows]
+
+    print(f"  Parallel normalization across {len(chunks)} CPU worker processes...")
+    with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+        chunk_results = list(executor.map(_normalize_chunk, chunks))
+
+    all_normalized = [row for chunk in chunk_results for row in chunk]
+
+    return pd.DataFrame(
+        all_normalized,
+        columns=['entity_id', 'business_name_clean', 'business_address_clean', 'country', 'postal_code', 'name_tokens'],
+        dtype=str
+    )
+
+
+def preprocess_tsv(input_filepath: str) -> pd.DataFrame:
+    """Reads a raw TSV, normalizes it, and returns the cleaned DataFrame."""
+    print(f"Loading raw data from: {input_filepath}")
+    df = pd.read_csv(input_filepath, sep='\t', dtype=str)
+    return normalize_dataframe(df)
 
 
 def process_file(input_filepath: str, output_filepath: str) -> None:
     """Reads a raw TSV, normalizes it, and saves it as a clean TSV."""
+    if os.path.isfile(output_filepath) and os.path.getsize(output_filepath) > 1024:
+        print(f"File already normalized: {output_filepath} (skipping re-run)\n")
+        return
+
     print(f"Loading raw data from: {input_filepath}")
     df = pd.read_csv(input_filepath, sep='\t', dtype=str)
-    
+
     print(f"Normalizing {len(df):,} records...")
     norm_df = normalize_dataframe(df)
-    
+
     os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
     norm_df.to_csv(output_filepath, sep='\t', index=False)
     print(f"Successfully saved normalized dataset to: {output_filepath} ({len(norm_df):,} rows)\n")
