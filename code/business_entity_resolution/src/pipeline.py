@@ -3,10 +3,10 @@ End-to-End Business Entity Resolution Pipeline
 Amazon ML Challenge 2026
 
 Orchestrates all 3 stages:
-  - Stage 1 (Person 1): Preprocessing & Normalization (preprocessing.py)
-  - Stage 2 (Person 2): Candidate Generation & Blocking (blocking.py)
-  - Stage 3A (Person 3A): Pairwise Feature Extraction (features.py)
-  - Stage 3B (Person 3B): Model Inference & F_0.5 Thresholding (train_predict.py)
+  - Stage 1: Preprocessing & Normalization (preprocessing.py)
+  - Stage 2: Candidate Generation & Blocking (blocking.py)
+  - Stage 3A: 24-Feature Pairwise Engineering (features.py)
+  - Stage 3B: GPU XGBoost Training & Inference (train_predict.py)
   - Validation: utils/validate_submission.py
 """
 
@@ -24,8 +24,7 @@ try:
     from .features import extract_features
     from .train_predict import (
         load_saved_model, predict_matches, generate_submission,
-        get_feature_function, train_model, generate_synthetic_training_data,
-        DEFAULT_MODEL_DIR, save_model
+        train_model, build_training_dataset, DEFAULT_MODEL_DIR, save_model
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,8 +33,7 @@ except ImportError:
     from features import extract_features
     from train_predict import (
         load_saved_model, predict_matches, generate_submission,
-        get_feature_function, train_model, generate_synthetic_training_data,
-        DEFAULT_MODEL_DIR, save_model
+        train_model, build_training_dataset, DEFAULT_MODEL_DIR, save_model
     )
 
 
@@ -61,16 +59,18 @@ def run_pipeline(
     output_dir: str = "output",
     model_path: str = None,
     top_k: int = 30,
+    use_gpu: bool = True,
     validate: bool = True
 ):
     os.makedirs(output_dir, exist_ok=True)
     workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-    print("=" * 72)
-    print(" Amazon ML Challenge 2026: End-to-End Pipeline Execution")
+    print("=" * 80)
+    print(" Amazon ML Challenge 2026: GPU-Optimized End-to-End Pipeline Execution")
     print(f" Data Directory:   {data_dir}")
     print(f" Output Directory: {output_dir}")
-    print("=" * 72)
+    print(f" GPU Enabled:      {use_gpu} (Target: RTX 5060 8GB)")
+    print("=" * 80)
 
     # ----------------------------------------------------
     # Stage 1: Preprocessing & Normalization
@@ -111,19 +111,17 @@ def run_pipeline(
     print(f"  [OK] Saved candidate pairs: {len(candidate_df):,} rows to {candidate_path}")
 
     # ----------------------------------------------------
-    # Stage 3: Feature Extraction & Model Inference
+    # Stage 3: Feature Extraction & GPU Model Inference
     # ----------------------------------------------------
-    print("\n>>> Stage 3: Model Inference & Submission Generation (Person 3A & 3B) <<<")
+    print("\n>>> Stage 3: 24-Feature Extraction & GPU XGBoost Inference (Person 3A & 3B) <<<")
 
-    # Resolve or train model
-    resolved_model_path = model_path or os.path.join(DEFAULT_MODEL_DIR, "entity_resolution_model.pkl")
+    resolved_model_path = model_path or os.path.join(DEFAULT_MODEL_DIR, "xgboost_entity_resolver.pkl")
     if not os.path.isfile(resolved_model_path):
-        print(f"  Model not found at {resolved_model_path}. Training a fast model on synthetic data...")
-        X_syn, y_syn = generate_synthetic_training_data(n_samples=5000)
-        model, threshold, f05 = train_model(X_syn, y_syn, backend="sklearn", n_folds=3)
-        resolved_model_path = save_model(model, threshold, f05, DEFAULT_MODEL_DIR, "sklearn")
+        print(f"  Model not found at {resolved_model_path}.")
+        print("  Please train the model first using train_predict.py --mode train")
+        sys.exit(1)
     else:
-        model, threshold, backend = load_saved_model(resolved_model_path)
+        model, threshold, cv_score = load_saved_model(resolved_model_path)
 
     # Build entity lookup from normalized dataframes
     print("  Building combined entity lookup from normalized records...")
@@ -133,21 +131,18 @@ def run_pipeline(
     entity_lookup.update(dataframe_to_entity_lookup(df_s3))
     print(f"  Lookup ready with {len(entity_lookup):,} total entities.")
 
-    # Feature extraction function (Person 3A)
-    feature_fn = get_feature_function(use_mock=False)
-
     # Run inference
-    predicted_matches = predict_matches(candidate_df, entity_lookup, model, threshold, feature_fn)
+    predicted_matches = predict_matches(model, threshold, candidate_df, entity_lookup)
 
     # Generate final submission TSV
     matching_path = os.path.join(output_dir, "matching_results.tsv")
     generate_submission(candidate_df, predicted_matches, matching_path)
 
-    print("\n" + "=" * 72)
+    print("\n" + "=" * 80)
     print(" [OK] End-to-End Pipeline Execution COMPLETE!")
     print(f"   1. Candidate Pairs:   {os.path.abspath(candidate_path)}")
     print(f"   2. Matching Results:  {os.path.abspath(matching_path)}")
-    print("=" * 72)
+    print("=" * 80)
 
     # ----------------------------------------------------
     # Validation against official submission validator
@@ -174,6 +169,7 @@ def main():
     parser.add_argument("--output-dir", default="output", help="Folder to write TSV outputs")
     parser.add_argument("--model-path", default=None, help="Path to pre-trained model (.pkl)")
     parser.add_argument("--top-k", type=int, default=30, help="Top K candidates for blocking")
+    parser.add_argument("--use-gpu", action="store_true", default=True, help="Enable GPU acceleration (RTX 5060)")
     parser.add_argument("--no-validate", action="store_true", help="Skip validator script check")
     args = parser.parse_args()
 
@@ -182,6 +178,7 @@ def main():
         output_dir=args.output_dir,
         model_path=args.model_path,
         top_k=args.top_k,
+        use_gpu=args.use_gpu,
         validate=not args.no_validate
     )
 

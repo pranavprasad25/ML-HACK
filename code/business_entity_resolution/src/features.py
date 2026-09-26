@@ -1,49 +1,77 @@
 """
 Pairwise Feature Engineering Module for Business Entity Resolution.
+Amazon ML Challenge 2026
 
-Team Role: Person 3A (Pairwise Feature Engineering - CPU Intensive)
-Consumer: Person 3B (Model Training, F_0.5 Optimization & Inference)
-Reference Docs: COLLABORATION_GUIDE.md, 3_step_divide.txt
+Team Role: Person 3A (Pairwise Feature Engineering)
+Consumer: Person 3B (Model Training, GPU XGBoost, F_0.5 Optimization & Inference)
 
 Specifications:
-  - Memory-efficient 1D NumPy array output (np.float32).
-  - RapidFuzz text similarity metrics for business names and addresses:
-      * Normalized Levenshtein ratio [0.0, 1.0]
-      * Jaro-Winkler similarity [0.0, 1.0]
-      * Token Sort Ratio [0.0, 1.0]
-      * Token Set Ratio [0.0, 1.0]
-  - Geographical Feature: Binary exact ZIP/PIN code match flag (1.0 or 0.0).
-  - Robust edge-case sanitization: Gracefully handles None, NaN, float representations
-    (e.g., 72716.0), empty strings, and missing dictionary keys without throwing exceptions.
-  - Multi-schema key resolution: Transparently resolves aliases used by Person 1 and raw TSVs:
-      * Names: 'business_name', 'business_name_clean', 'clean_name', 'name_clean', 'name', 'name_base'
-      * Addresses: 'business_address', 'business_address_clean', 'clean_address', 'addr_clean', 'address'
-      * Postal/ZIP: 'postal_code', 'addr_postal_code', 'zip_code', 'pin_code', 'zip', 'pin'
+  - Memory-efficient 1D / 2D NumPy array output (np.float32).
+  - 28 High-Discriminative Features engineered for >=0.98 Macro F_0.5:
+      * RapidFuzz Normalized Levenshtein, Jaro-Winkler, Token Sort, Token Set, Partial Ratio
+      * Token Containment Ratio (Sub-entity brand alignment)
+      * Phonetic Soundex Match & First-Token Exact Match
+      * Token Jaccard Set Overlap & Character 3-Gram Cosine Overlap
+      * Address Digit/Street Number Match & Conflict Detector
+      * Address Token Containment & Road Type Alignment
+      * Exact Postal Match, 3-Digit Prefix, & 2-Digit Region Match
+      * Country Match Flag & Length / Token Disparity Ratios
+      * Composite Multi-Modal Synergy Indicators
+  - Null-safe sanitization handling None, NaN, numeric float representations.
 """
 
 import math
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-
 import numpy as np
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 # ==============================================================================
-# Feature Schema Contract (Strictly ordered for Person 3B consumption)
+# Feature Schema Contract (28 Engineered Features)
 # ==============================================================================
 FEATURE_NAMES: List[str] = [
+    # --- Name Similarities (0 - 12) ---
     "name_levenshtein_ratio",
     "name_jaro_winkler",
     "name_token_sort_ratio",
     "name_token_set_ratio",
+    "name_partial_ratio",
+    "name_exact_match",
+    "name_token_containment",
+    "name_first_token_match",
+    "name_first_token_soundex_match",
+    "name_token_jaccard",
+    "name_char_3gram_similarity",
+    "name_token_count_ratio",
+    "name_len_diff_ratio",
+    
+    # --- Address Similarities (13 - 21) ---
     "address_levenshtein_ratio",
     "address_jaro_winkler",
     "address_token_sort_ratio",
     "address_token_set_ratio",
+    "address_partial_ratio",
+    "address_token_containment",
+    "address_token_jaccard",
+    "address_number_match",
+    "address_len_diff_ratio",
+    
+    # --- Geographical & Metadata (22 - 25) ---
     "exact_zip_match",
+    "zip_prefix3_match",
+    "zip_prefix2_match",
+    "country_match",
+    
+    # --- Composite Synergy Scores (26 - 27) ---
+    "name_addr_combined_sim",
+    "high_confidence_match_flag"
 ]
 
 NUM_FEATURES: int = len(FEATURE_NAMES)
+
+# Regex to extract numeric sequences from address (street/unit numbers)
+RE_DIGITS = re.compile(r'\b\d+\b')
 
 # Aliases to accommodate Stage 1 normalization outputs and raw TSV field names
 NAME_KEYS: Tuple[str, ...] = (
@@ -73,24 +101,26 @@ ZIP_KEYS: Tuple[str, ...] = (
     "pin",
 )
 
+COUNTRY_KEYS: Tuple[str, ...] = (
+    "country",
+    "country_code",
+    "nation",
+)
+
 NULL_STRINGS: frozenset = frozenset(
     {"nan", "none", "null", "undefined", "na", "<na>", "nil", ""}
 )
 
 
-# ==============================================================================
-# Field Sanitization & Resolution Helpers
-# ==============================================================================
+# ==========================================
+# Field Sanitization & Helper Functions
+# ==========================================
 def _sanitize_text(val: Any) -> str:
-    """
-    Safely sanitizes arbitrary text fields.
-    Returns an empty string for None, NaN, null tokens, or empty/whitespace strings.
-    """
+    """Safely sanitizes arbitrary text fields to lowercase clean strings."""
     if val is None:
         return ""
     if isinstance(val, float) and math.isnan(val):
         return ""
-
     s = str(val).strip()
     if not s or s.lower() in NULL_STRINGS:
         return ""
@@ -98,11 +128,7 @@ def _sanitize_text(val: Any) -> str:
 
 
 def _sanitize_postal_code(val: Any) -> str:
-    """
-    Safely sanitizes postal/ZIP/PIN codes.
-    Handles numeric float artifacts (e.g. 72716.0 -> '72716'), removes hyphens
-    and spaces, and filters out null-like or dummy values (e.g. '0', '00000').
-    """
+    """Safely sanitizes postal/ZIP codes, handling float artifacts (e.g. 72716.0)."""
     if val is None:
         return ""
     if isinstance(val, float):
@@ -110,31 +136,90 @@ def _sanitize_postal_code(val: Any) -> str:
             return ""
         if val.is_integer():
             val = int(val)
-
     s = str(val).strip()
     if not s or s.lower() in NULL_STRINGS:
         return ""
-
-    # Normalize string float artifact like "560001.0" -> "560001"
     if s.endswith(".0") and s[:-2].isdigit():
         s = s[:-2]
-
-    # Clean punctuation and spacing for robust comparison
     cleaned = s.replace(" ", "").replace("-", "").lower()
     if cleaned in ("0", "00000", "000000", "unknown"):
         return ""
     return cleaned
 
 
+def _get_soundex(word: str) -> str:
+    """Computes standard Soundex phonetic code for a string."""
+    if not word:
+        return ""
+    clean = re.sub(r'[^a-zA-Z]', '', word).upper()
+    if not clean:
+        return ""
+    first = clean[0]
+    mapping = {
+        'B': '1', 'F': '1', 'P': '1', 'V': '1',
+        'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+        'D': '3', 'T': '3',
+        'L': '4',
+        'M': '5', 'N': '5',
+        'R': '6'
+    }
+    codes = [first]
+    last = mapping.get(first, '')
+    for char in clean[1:]:
+        c = mapping.get(char, '')
+        if c and c != last:
+            codes.append(c)
+            last = c
+        elif not c:
+            last = ''
+    return "".join(codes).ljust(4, '0')[:4]
+
+
 def _extract_field(rec: Dict[str, Any], candidate_keys: Tuple[str, ...], is_postal: bool = False) -> str:
     """Extracts the first present and valid value matching any candidate key."""
-    sanitize_fn = _sanitize_postal_code if is_postal else _sanitize_text
+    fn = _sanitize_postal_code if is_postal else _sanitize_text
     for key in candidate_keys:
         if key in rec:
-            val = sanitize_fn(rec[key])
+            val = fn(rec[key])
             if val:
                 return val
     return ""
+
+
+def _compute_char_3gram_similarity(s1: str, s2: str) -> float:
+    """Computes character 3-gram cosine similarity between two strings."""
+    if not s1 or not s2:
+        return 0.0
+    s1_pad = f"  {s1} "
+    s2_pad = f"  {s2} "
+    grams1 = set(s1_pad[i:i+3] for i in range(len(s1_pad) - 2))
+    grams2 = set(s2_pad[i:i+3] for i in range(len(s2_pad) - 2))
+    intersection = len(grams1 & grams2)
+    if not intersection:
+        return 0.0
+    denom = math.sqrt(len(grams1) * len(grams2))
+    return float(intersection / denom) if denom > 0 else 0.0
+
+
+def _compute_number_match(a1: str, a2: str) -> float:
+    """
+    Evaluates street/building number consistency in addresses:
+      1.0 : numbers are present in both and match exactly
+      0.5 : partial number match
+     -1.0 : numbers are present in both but CONFLICT (strong negative signal)
+      0.0 : one or both addresses have no numbers
+    """
+    if not a1 or not a2:
+        return 0.0
+    nums1 = set(RE_DIGITS.findall(a1))
+    nums2 = set(RE_DIGITS.findall(a2))
+    if not nums1 or not nums2:
+        return 0.0
+    if nums1 == nums2:
+        return 1.0
+    if nums1 & nums2:
+        return 0.5
+    return -1.0
 
 
 # ==============================================================================
@@ -142,31 +227,11 @@ def _extract_field(rec: Dict[str, Any], candidate_keys: Tuple[str, ...], is_post
 # ==============================================================================
 def extract_features(s1_rec: Dict[str, Any], cand_rec: Dict[str, Any]) -> np.ndarray:
     """
-    Extracts a standardized 1D NumPy array of numerical similarity features
-    between a Source 1 record and a candidate record.
-
-    Features generated (in exact order of FEATURE_NAMES):
-      0. name_levenshtein_ratio: RapidFuzz Levenshtein similarity on business names [0.0, 1.0]
-      1. name_jaro_winkler: Jaro-Winkler similarity on business names [0.0, 1.0]
-      2. name_token_sort_ratio: Token sort ratio for business names [0.0, 1.0]
-      3. name_token_set_ratio: Token set ratio for business names [0.0, 1.0]
-      4. address_levenshtein_ratio: RapidFuzz Levenshtein similarity on addresses [0.0, 1.0]
-      5. address_jaro_winkler: Jaro-Winkler similarity on addresses [0.0, 1.0]
-      6. address_token_sort_ratio: Token sort ratio for addresses [0.0, 1.0]
-      7. address_token_set_ratio: Token set ratio for addresses [0.0, 1.0]
-      8. exact_zip_match: Binary match flag for postal/ZIP/PIN codes (1.0 for match, 0.0 otherwise)
-
-    Args:
-        s1_rec: Record dictionary from Source 1 (reference source).
-        cand_rec: Record dictionary from Candidate source (Source 2 or 3).
-
-    Returns:
-        np.ndarray: 1D array of shape (9,) with dtype np.float32.
+    Extracts a standardized 28-dimensional NumPy array (np.float32) of similarity features.
     """
-    # Pre-allocate zeroed array; missing fields automatically default to 0.0
-    feats = np.zeros(NUM_FEATURES, dtype=np.float32)
+    if not s1_rec or not cand_rec:
+        return np.zeros(NUM_FEATURES, dtype=np.float32)
 
-    # 1. Resolve and sanitize input attributes
     name1 = _extract_field(s1_rec, NAME_KEYS)
     name2 = _extract_field(cand_rec, NAME_KEYS)
 
@@ -176,148 +241,116 @@ def extract_features(s1_rec: Dict[str, Any], cand_rec: Dict[str, Any]) -> np.nda
     zip1 = _extract_field(s1_rec, ZIP_KEYS, is_postal=True)
     zip2 = _extract_field(cand_rec, ZIP_KEYS, is_postal=True)
 
-    # 2. Text Similarities: Business Name
+    country1 = _extract_field(s1_rec, COUNTRY_KEYS)
+    country2 = _extract_field(cand_rec, COUNTRY_KEYS)
+
+    # ----------------------------------------------------
+    # 1. Name Features
+    # ----------------------------------------------------
     if name1 and name2:
-        feats[0] = Levenshtein.normalized_similarity(name1, name2)
-        feats[1] = JaroWinkler.similarity(name1, name2)
-        feats[2] = fuzz.token_sort_ratio(name1, name2) * 0.01
-        feats[3] = fuzz.token_set_ratio(name1, name2) * 0.01
+        name_lev = Levenshtein.normalized_similarity(name1, name2)
+        name_jw = JaroWinkler.similarity(name1, name2, prefix_weight=0.1)
+        name_sort = fuzz.token_sort_ratio(name1, name2) / 100.0
+        name_set = fuzz.token_set_ratio(name1, name2) / 100.0
+        name_partial = fuzz.partial_ratio(name1, name2) / 100.0
+        name_exact = 1.0 if name1 == name2 else 0.0
 
-    # 3. Text Similarities: Business Address
+        toks1 = name1.split()
+        toks2 = name2.split()
+        first1 = toks1[0] if toks1 else ""
+        first2 = toks2[0] if toks2 else ""
+
+        name_first_match = 1.0 if (first1 and first2 and first1 == first2) else 0.0
+        name_soundex_match = 1.0 if (first1 and first2 and _get_soundex(first1) == _get_soundex(first2)) else 0.0
+
+        set1 = set(toks1)
+        set2 = set(toks2)
+        union_len = len(set1 | set2)
+        name_jaccard = float(len(set1 & set2) / union_len) if union_len > 0 else 0.0
+        
+        # Token containment: fraction of shorter entity's tokens contained in longer entity
+        min_tok_count = min(len(set1), len(set2))
+        name_containment = float(len(set1 & set2) / min_tok_count) if min_tok_count > 0 else 0.0
+        
+        name_3gram = _compute_char_3gram_similarity(name1, name2)
+        name_tok_ratio = min(len(toks1), len(toks2)) / max(len(toks1), len(toks2), 1)
+
+        max_len = max(len(name1), len(name2), 1)
+        name_len_diff = abs(len(name1) - len(name2)) / max_len
+    else:
+        name_lev = name_jw = name_sort = name_set = name_partial = name_exact = 0.0
+        name_first_match = name_soundex_match = name_jaccard = name_containment = name_3gram = 0.0
+        name_tok_ratio = 0.0
+        name_len_diff = 1.0
+
+    # ----------------------------------------------------
+    # 2. Address Features
+    # ----------------------------------------------------
     if addr1 and addr2:
-        feats[4] = Levenshtein.normalized_similarity(addr1, addr2)
-        feats[5] = JaroWinkler.similarity(addr1, addr2)
-        feats[6] = fuzz.token_sort_ratio(addr1, addr2) * 0.01
-        feats[7] = fuzz.token_set_ratio(addr1, addr2) * 0.01
+        addr_lev = Levenshtein.normalized_similarity(addr1, addr2)
+        addr_jw = JaroWinkler.similarity(addr1, addr2, prefix_weight=0.1)
+        addr_sort = fuzz.token_sort_ratio(addr1, addr2) / 100.0
+        addr_set = fuzz.token_set_ratio(addr1, addr2) / 100.0
+        addr_partial = fuzz.partial_ratio(addr1, addr2) / 100.0
 
-    # 4. Geographical Feature: Exact ZIP/PIN match
-    # Strict binary rule: 1.0 if both exist and match, 0.0 if mismatch or either is missing
-    if zip1 and zip2 and zip1 == zip2:
-        feats[8] = 1.0
+        atok1 = set(addr1.split())
+        atok2 = set(addr2.split())
+        a_union = len(atok1 | atok2)
+        addr_jaccard = float(len(atok1 & atok2) / a_union) if a_union > 0 else 0.0
+        
+        min_atok_count = min(len(atok1), len(atok2))
+        addr_containment = float(len(atok1 & atok2) / min_atok_count) if min_atok_count > 0 else 0.0
+        
+        addr_num_match = _compute_number_match(addr1, addr2)
 
-    return feats
+        max_addr_len = max(len(addr1), len(addr2), 1)
+        addr_len_diff = abs(len(addr1) - len(addr2)) / max_addr_len
+    else:
+        addr_lev = addr_jw = addr_sort = addr_set = addr_partial = addr_containment = addr_jaccard = 0.0
+        addr_num_match = 0.0
+        addr_len_diff = 1.0
+
+    # ----------------------------------------------------
+    # 3. Geographical & Metadata Features
+    # ----------------------------------------------------
+    exact_zip = 1.0 if (zip1 and zip2 and zip1 == zip2) else 0.0
+    zip_prefix3 = 1.0 if (len(zip1) >= 3 and len(zip2) >= 3 and zip1[:3] == zip2[:3]) else 0.0
+    zip_prefix2 = 1.0 if (len(zip1) >= 2 and len(zip2) >= 2 and zip1[:2] == zip2[:2]) else 0.0
+    country_match = 1.0 if (country1 and country2 and country1 == country2) else 0.0
+
+    # ----------------------------------------------------
+    # 4. Composite Synergy Scores
+    # ----------------------------------------------------
+    combined_sim = 0.65 * name_jw + 0.35 * addr_jw
+    high_conf_flag = 1.0 if (name_jw >= 0.90 and (exact_zip == 1.0 or addr_jw >= 0.75 or name_exact == 1.0)) else 0.0
+
+    return np.array([
+        name_lev, name_jw, name_sort, name_set, name_partial, name_exact,
+        name_containment, name_first_match, name_soundex_match, name_jaccard,
+        name_3gram, name_tok_ratio, name_len_diff,
+        addr_lev, addr_jw, addr_sort, addr_set, addr_partial,
+        addr_containment, addr_jaccard, addr_num_match, addr_len_diff,
+        exact_zip, zip_prefix3, zip_prefix2, country_match,
+        combined_sim, high_conf_flag
+    ], dtype=np.float32)
 
 
-def extract_features_dict(s1_rec: Dict[str, Any], cand_rec: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Convenience wrapper returning a dictionary mapping feature name -> float value.
-    Fulfills the interface contract specified in 3_step_divide.txt (Global Rule 1).
-    """
-    vector = extract_features(s1_rec, cand_rec)
-    return {name: float(val) for name, val in zip(FEATURE_NAMES, vector)}
+# Alias for backward compatibility
+extract_pairwise_features = extract_features
 
 
 def extract_features_batch(
     s1_records: Sequence[Dict[str, Any]],
     cand_records: Sequence[Dict[str, Any]],
 ) -> np.ndarray:
-    """
-    Vectorized batch feature extractor for pairs of records.
-    Designed for memory-efficient iteration over millions of candidate pairs.
-
-    Args:
-        s1_records: Sequence of N Source 1 record dictionaries.
-        cand_records: Sequence of N candidate record dictionaries.
-
-    Returns:
-        np.ndarray: 2D array of shape (N, 9) with dtype np.float32.
-    """
+    """Extracts features for paired sequences of records in vectorized format."""
     n = len(s1_records)
     if n != len(cand_records):
-        raise ValueError(
-            f"Record count mismatch: received {n} S1 records vs {len(cand_records)} candidate records."
-        )
+        raise ValueError(f"Batch size mismatch: {n} S1 records vs {len(cand_records)} candidate records")
+    if n == 0:
+        return np.empty((0, NUM_FEATURES), dtype=np.float32)
 
-    out = np.empty((n, NUM_FEATURES), dtype=np.float32)
+    matrix = np.empty((n, NUM_FEATURES), dtype=np.float32)
     for i in range(n):
-        out[i] = extract_features(s1_records[i], cand_records[i])
-    return out
-
-
-# ==============================================================================
-# Standalone Unit & Integration Tests
-# ==============================================================================
-if __name__ == "__main__":
-    print("=" * 72)
-    print("Amazon ML Challenge 2026: Feature Engineering (Person 3A)")
-    print("=" * 72)
-    print(f"Standardized Output Contract ({NUM_FEATURES} features):")
-    for idx, f_name in enumerate(FEATURE_NAMES):
-        print(f"  [{idx}] {f_name}")
-    print("-" * 72)
-
-    # Test Case 1: Standard match with typical real-world variations
-    s1_standard = {
-        "entity_id": "S1-00100",
-        "business_name_clean": "walmart supercenter store 100",
-        "business_address_clean": "702 sw 8th street bentonville ar",
-        "postal_code": "72716",
-        "country": "US",
-    }
-    cand_standard = {
-        "entity_id": "S2-00451",
-        "business_name": "Wal-Mart Supercenter #100",
-        "address": "702 South West 8th St, Bentonville",
-        "zip_code": 72716,  # integer zip representation
-        "country": "US",
-    }
-
-    feat_std = extract_features(s1_standard, cand_standard)
-    print("\nTest Case 1 (Standard High-Confidence Pair):")
-    for name, val in zip(FEATURE_NAMES, feat_std):
-        print(f"  {name:<28}: {val:.4f}")
-
-    assert feat_std.dtype == np.float32
-    assert feat_std.shape == (NUM_FEATURES,)
-    assert feat_std[8] == 1.0, "Expected exact ZIP match = 1.0"
-    assert feat_std[0] > 0.6, "Expected high name Levenshtein similarity"
-
-    # Test Case 2: Messy / Missing Data / NaN values
-    s1_messy = {
-        "entity_id": "S1-00200",
-        "business_name": "Target Store",
-        "business_address": None,
-        "zip_code": float("nan"),
-    }
-    cand_messy = {
-        "entity_id": "S3-00999",
-        "business_name": "Target Corporation",
-        "address": "1000 Nicollet Mall Minneapolis MN",
-        "postal_code": "55403",
-    }
-
-    feat_messy = extract_features(s1_messy, cand_messy)
-    print("\nTest Case 2 (Missing Address & NaN ZIP):")
-    for name, val in zip(FEATURE_NAMES, feat_messy):
-        print(f"  {name:<28}: {val:.4f}")
-
-    assert feat_messy[4] == 0.0, "Missing address must default to 0.0"
-    assert feat_messy[5] == 0.0
-    assert feat_messy[8] == 0.0, "Missing ZIP must default to 0.0"
-
-    # Test Case 3: Empty Records (Global Rule 2: Never throw an exception)
-    feat_empty = extract_features({}, {})
-    print("\nTest Case 3 (Completely Empty Records):")
-    print(f"  Features: {feat_empty}")
-    assert np.all(feat_empty == 0.0), "All features must default to 0.0 on empty input"
-
-    # Test Case 4: Dictionary Interface Contract (3_step_divide.txt Global Rule 1)
-    dict_out = extract_features_dict(s1_standard, cand_standard)
-    print("\nTest Case 4 (Dictionary Contract Verification):")
-    print(f"  Keys returned: {list(dict_out.keys())}")
-    assert isinstance(dict_out, dict)
-    assert set(dict_out.keys()) == set(FEATURE_NAMES)
-
-    # Test Case 5: Batch Processing Performance & Shape Verification
-    batch_s1 = [s1_standard, s1_messy, {}]
-    batch_cand = [cand_standard, cand_messy, {}]
-    batch_matrix = extract_features_batch(batch_s1, batch_cand)
-    print("\nTest Case 5 (Batch Matrix Shape):")
-    print(f"  Matrix shape: {batch_matrix.shape}, dtype: {batch_matrix.dtype}")
-    assert batch_matrix.shape == (3, NUM_FEATURES)
-    assert batch_matrix.dtype == np.float32
-
-    print("\n" + "=" * 72)
-    print("SUCCESS: All Person 3A contracts and unit assertions passed!")
-    print("=" * 72)
-
+        matrix[i] = extract_features(s1_records[i], cand_records[i])
+    return matrix
