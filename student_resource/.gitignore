@@ -1,0 +1,16 @@
+# Exclude raw dataset files (1.5 GB+)
+dataset/train/*.tsv
+dataset/test/*.tsv
+dataset/**/*.tsv
+
+# Exclude generated outputs
+output/
+*.tsv
+
+# Exclude Python environment & cache
+venv/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
