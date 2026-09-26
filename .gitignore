@@ -1,11 +1,15 @@
-# Exclude raw dataset files (1.5 GB+)
+# Exclude raw dataset files & TSVs (1.5 GB+)
 dataset/train/*.tsv
 dataset/test/*.tsv
 dataset/**/*.tsv
-
-# Exclude generated outputs
-output/
 *.tsv
+**/*.tsv
+
+# Exclude generated outputs, normalized data, and test scratch
+output/
+output_test/
+data/
+tests/
 
 # Exclude Python environment & cache
 venv/

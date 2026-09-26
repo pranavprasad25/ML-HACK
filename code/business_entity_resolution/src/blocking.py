@@ -2,9 +2,9 @@
 Stage 2: Candidate Generation & Blocking Module (Person 2)
 Amazon ML Challenge 2026: Business Entity Resolution
 
-This module filters millions of potential comparisons down to a small, high-recall
-candidate pool (top 15-30 candidates per S1 entity) using multi-key inverted indexing,
-country partitioning, and TF-IDF character n-gram Nearest Neighbors.
+This module filters millions of potential comparisons down to a high-recall candidate pool
+(top 25-50 candidates per S1 entity) using country partitioning, multi-key inverted indexing
+(postal code, first name token, compound postal+token, phonetic Soundex), and TF-IDF character n-gram Nearest Neighbors.
 """
 
 import os
@@ -51,6 +51,7 @@ def get_soundex(word: str) -> str:
             
     return "".join(codes).ljust(4, '0')[:4]
 
+
 # ==========================================
 # 2. MULTI-KEY BLOCKING ENGINE
 # ==========================================
@@ -63,12 +64,13 @@ def generate_candidates_for_country(
     """
     Generates high-recall candidate target IDs (S2/S3) for each S1 entity in a country partition.
     Combines:
-    1. Exact Blocking Rule: Country + Postal Code
-    2. Exact Blocking Rule: Country + First Word of name_tokens
-    3. Phonetic Soundex Indexing
-    4. TF-IDF Character 3-5 Gram Cosine Nearest Neighbors (Name + Address)
+    1. Exact Blocking Rule: Postal Code match
+    2. Exact Blocking Rule: First Word of name_tokens match
+    3. Compound Blocking Rule: Exact Postal Code + First Word match
+    4. Phonetic Blocking Rule: Soundex key match on first word
+    5. Vector Search: TF-IDF Character 3-5 Gram Cosine Nearest Neighbors (Name + Address)
     """
-    s1_candidates: Dict[str, Set[str]] = {s1_id: set() for s1_id in df_s1['entity_id']}
+    s1_candidates: Dict[str, Set[str]] = {str(s1_id).strip(): set() for s1_id in df_s1['entity_id']}
     
     if len(df_s1) == 0 or len(df_targets) == 0:
         return s1_candidates
@@ -76,16 +78,17 @@ def generate_candidates_for_country(
     target_ids = df_targets['entity_id'].values
 
     # ----------------------------------------------------
-    # Inverted Index 1: Postal Code & First Word Blocking
+    # Inverted Index Multi-Key Construction
     # ----------------------------------------------------
     postal_index: Dict[str, List[int]] = {}
     first_word_index: Dict[str, List[int]] = {}
+    compound_index: Dict[str, List[int]] = {}
     soundex_index: Dict[str, List[int]] = {}
 
     for idx, row in enumerate(df_targets.itertuples()):
-        postal = getattr(row, 'postal_code', '')
-        tokens = str(getattr(row, 'name_tokens', '')).split()
-        first_word = tokens[0] if tokens else ""
+        postal = str(getattr(row, 'postal_code', '') or '').strip()
+        tokens = str(getattr(row, 'name_tokens', '') or getattr(row, 'business_name_clean', '') or '').split()
+        first_word = tokens[0].strip() if tokens else ""
 
         if postal:
             postal_index.setdefault(postal, []).append(idx)
@@ -94,13 +97,25 @@ def generate_candidates_for_country(
             soundex_key = get_soundex(first_word)
             if soundex_key:
                 soundex_index.setdefault(soundex_key, []).append(idx)
+        if postal and first_word:
+            compound_key = f"{postal}_{first_word}"
+            compound_index.setdefault(compound_key, []).append(idx)
 
     # Fast Inverted Index Lookup for S1 entities
     for s1_row in df_s1.itertuples():
-        s1_id = s1_row.entity_id
-        postal = getattr(s1_row, 'postal_code', '')
-        tokens = str(getattr(s1_row, 'name_tokens', '')).split()
-        first_word = tokens[0] if tokens else ""
+        s1_id = str(s1_row.entity_id).strip()
+        postal = str(getattr(s1_row, 'postal_code', '') or '').strip()
+        tokens = str(getattr(s1_row, 'name_tokens', '') or getattr(s1_row, 'business_name_clean', '') or '').split()
+        first_word = tokens[0].strip() if tokens else ""
+
+        # Compound Rule: Postal + First Word exact match
+        if postal and first_word:
+            compound_key = f"{postal}_{first_word}"
+            if compound_key in compound_index:
+                for target_idx in compound_index[compound_key][:20]:
+                    tid = target_ids[target_idx]
+                    if tid.startswith(('S2-', 'S3-')):
+                        s1_candidates[s1_id].add(tid)
 
         # Exact Rule A: Postal Code match
         if postal and postal in postal_index:
@@ -116,7 +131,7 @@ def generate_candidates_for_country(
                 if tid.startswith(('S2-', 'S3-')):
                     s1_candidates[s1_id].add(tid)
 
-        # Exact Rule C: Phonetic Soundex match
+        # Phonetic Rule C: Soundex match
         if first_word and len(s1_candidates[s1_id]) < 10:
             soundex_key = get_soundex(first_word)
             if soundex_key in soundex_index:
@@ -142,10 +157,11 @@ def generate_candidates_for_country(
 
     s1_id_list = df_s1['entity_id'].values
     for i, s1_id in enumerate(s1_id_list):
+        s1_id_str = str(s1_id).strip()
         for idx in indices[i]:
             tid = target_ids[idx]
             if tid.startswith(('S2-', 'S3-')):
-                s1_candidates[s1_id].add(tid)
+                s1_candidates[s1_id_str].add(tid)
 
     return s1_candidates
 
@@ -167,12 +183,12 @@ def generate_candidate_pairs(
     if 'country' not in df_targets.columns:
         df_targets['country'] = 'UNKNOWN'
 
-    countries = df_s1['country'].str.upper().unique()
+    countries = df_s1['country'].astype(str).str.upper().unique()
     all_candidate_map: Dict[str, Set[str]] = {}
 
     for c in countries:
-        sub_s1 = df_s1[df_s1['country'].str.upper() == c]
-        sub_target = df_targets[df_targets['country'].str.upper() == c]
+        sub_s1 = df_s1[df_s1['country'].astype(str).str.upper() == c]
+        sub_target = df_targets[df_targets['country'].astype(str).str.upper() == c]
 
         if len(sub_target) == 0:
             sub_target = df_targets
@@ -183,15 +199,21 @@ def generate_candidate_pairs(
 
     rows = []
     for s1_id in df_s1['entity_id']:
-        cand_set = all_candidate_map.get(s1_id, set())
-        valid_cands = [cid for cid in sorted(cand_set) if cid.startswith(('S2-', 'S3-'))]
+        s1_id_str = str(s1_id).strip()
+        cand_set = all_candidate_map.get(s1_id_str, set())
+        # Filter strictly S2- and S3- prefixed IDs, drop self matches, sort deterministically
+        valid_cands = sorted([cid for cid in cand_set if cid.startswith(('S2-', 'S3-')) and cid != s1_id_str])
         rows.append({
-            'source1_entity_id': s1_id,
+            'source1_entity_id': s1_id_str,
             'candidate_entity_ids': ",".join(valid_cands)
         })
 
     candidate_df = pd.DataFrame(rows, columns=['source1_entity_id', 'candidate_entity_ids'])
     return candidate_df
+
+
+# Alias for pipeline compatibility
+generate_candidates_by_country = generate_candidate_pairs
 
 
 # ==========================================
@@ -244,12 +266,13 @@ def iterate_candidate_pairs(candidates_path: str) -> Generator[Tuple[str, str], 
             if not line_str:
                 continue
             parts = line_str.split('\t')
-            s1_id = parts[0]
-            cand_str = parts[1] if len(parts) > 1 else ""
+            s1_id = parts[0].strip()
+            cand_str = parts[1].strip() if len(parts) > 1 else ""
             if cand_str:
                 for cand_id in cand_str.split(','):
-                    if cand_id:
-                        yield (s1_id, cand_id)
+                    cand_id_clean = cand_id.strip()
+                    if cand_id_clean:
+                        yield (s1_id, cand_id_clean)
 
 
 # ==========================================
