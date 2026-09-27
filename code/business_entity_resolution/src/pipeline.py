@@ -173,7 +173,7 @@ def main():
     parser.add_argument("--data-dir", default="dataset/test", help="Folder containing test_source1/2/3.tsv")
     parser.add_argument("--output-dir", default="output", help="Folder to write TSV outputs")
     parser.add_argument("--model-path", default=None, help="Path to pre-trained model (.pkl)")
-    parser.add_argument("--top-k", type=int, default=30, help="Top K candidates for blocking")
+    parser.add_argument("--top-k", type=int, default=50, help="Top K candidates for blocking (default: 50)")
     parser.add_argument("--no-validate", action="store_true", help="Skip validator script check")
     args = parser.parse_args()
 

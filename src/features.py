@@ -403,4 +403,3 @@ if __name__ == "__main__":
     print("\n" + "=" * 72)
     print("SUCCESS: All Person 3A contracts and unit assertions passed!")
     print("=" * 72)
-

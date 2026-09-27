@@ -9,7 +9,7 @@ dataset/**/*.tsv
 output/
 output_test/
 data/
-tests/
+scratch/
 
 # Exclude Python environment & cache
 venv/
