@@ -60,7 +60,7 @@ def run_pipeline(
     data_dir: str = "dataset/test",
     output_dir: str = "output",
     model_path: str = None,
-    top_k: int = 30,
+    top_k: int = 40,
     validate: bool = True
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -173,7 +173,7 @@ def main():
     parser.add_argument("--data-dir", default="dataset/test", help="Folder containing test_source1/2/3.tsv")
     parser.add_argument("--output-dir", default="output", help="Folder to write TSV outputs")
     parser.add_argument("--model-path", default=None, help="Path to pre-trained model (.pkl)")
-    parser.add_argument("--top-k", type=int, default=30, help="Top K candidates for blocking")
+    parser.add_argument("--top-k", type=int, default=40, help="Top K candidates for blocking")
     parser.add_argument("--no-validate", action="store_true", help="Skip validator script check")
     args = parser.parse_args()
 

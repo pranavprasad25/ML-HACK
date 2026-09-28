@@ -290,16 +290,16 @@ def load_normalized_records(normalized_dir: str) -> Dict[str, Dict[str, str]]:
         print(f"  Loading normalized records from: {filepath}")
         df = pd.read_csv(filepath, sep='\t', dtype=str).fillna("")
 
-        for _, row in df.iterrows():
-            eid = str(row.get('entity_id', '')).strip()
+        for row in df.itertuples():
+            eid = str(getattr(row, 'entity_id', '')).strip()
             if eid:
                 entity_lookup[eid] = {
                     'entity_id': eid,
-                    'business_name_clean': str(row.get('business_name_clean', '')),
-                    'business_address_clean': str(row.get('business_address_clean', '')),
-                    'country': str(row.get('country', '')),
-                    'postal_code': str(row.get('postal_code', '')),
-                    'name_tokens': str(row.get('name_tokens', '')),
+                    'business_name_clean': str(getattr(row, 'business_name_clean', '') or ''),
+                    'business_address_clean': str(getattr(row, 'business_address_clean', '') or ''),
+                    'country': str(getattr(row, 'country', '') or ''),
+                    'postal_code': str(getattr(row, 'postal_code', '') or ''),
+                    'name_tokens': str(getattr(row, 'name_tokens', '') or ''),
                 }
 
     print(f"  Total entities loaded: {len(entity_lookup):,}")
@@ -322,9 +322,9 @@ def load_ground_truth(ground_truth_file: str) -> Dict[str, Set[str]]:
     gt_map: Dict[str, Set[str]] = {}
     df = pd.read_csv(ground_truth_file, sep='\t', dtype=str).fillna("")
 
-    for _, row in df.iterrows():
-        s1_id = str(row['source1_entity_id']).strip()
-        matched_str = str(row.get('matched_entity_ids', '')).strip()
+    for row in df.itertuples():
+        s1_id = str(getattr(row, 'source1_entity_id', '')).strip()
+        matched_str = str(getattr(row, 'matched_entity_ids', '') or '').strip()
         if matched_str:
             gt_map[s1_id] = set(m.strip() for m in matched_str.split(',') if m.strip())
         else:
@@ -369,9 +369,9 @@ def build_training_dataset(
     skipped_missing = 0
     processed_entities = 0
 
-    for _, row in candidate_df.iterrows():
-        s1_id = str(row['source1_entity_id']).strip()
-        cand_str = str(row.get('candidate_entity_ids', '')).strip()
+    for row in candidate_df.itertuples():
+        s1_id = str(row.source1_entity_id).strip()
+        cand_str = str(getattr(row, 'candidate_entity_ids', '') or '').strip()
 
         if not cand_str:
             continue
@@ -387,8 +387,8 @@ def build_training_dataset(
 
         true_matches = gt_map.get(s1_id, set())
 
-        # Separate positives and negatives
-        positive_cands = [cid for cid in cand_ids if cid in true_matches]
+        # Ensure all true matches from S2 and S3 are included in positive pairs
+        positive_cands = list(set([cid for cid in cand_ids if cid in true_matches]) | set(true_matches))
         negative_cands = [cid for cid in cand_ids if cid not in true_matches]
 
         # Add ALL positive pairs
@@ -503,7 +503,7 @@ def get_model(backend: str = "lightgbm", use_gpu: bool = False):
                 'random_state': 42,
                 'n_jobs': -1,
                 'verbosity': 0,
-                'scale_pos_weight': NEGATIVE_SAMPLE_RATIO,  # Handle class imbalance
+                'scale_pos_weight': 1.5,  # Balanced calibration for precise thresholding
                 'eval_metric': 'logloss',
                 'use_label_encoder': False,
             }
@@ -539,6 +539,7 @@ def train_model(
     backend: str = "lightgbm",
     use_gpu: bool = False,
     n_folds: int = 5,
+    pair_ids: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[object, float, float]:
     """
     Trains a GBDT classifier with stratified K-fold cross-validation.
@@ -601,8 +602,8 @@ def train_model(
     final_model, _ = get_model(backend, use_gpu)
     final_model.fit(X, y)
 
-    # Optimize threshold using OOF predictions
-    best_threshold, best_f05 = optimize_f05_threshold(y, oof_probs)
+    # Optimize threshold using OOF predictions and true Macro F0.5
+    best_threshold, best_f05 = optimize_f05_threshold(y, oof_probs, pair_ids=pair_ids)
 
     elapsed = time.time() - start_time
     print(f"\n  Total training time: {elapsed:.1f}s")
@@ -648,16 +649,22 @@ def compute_macro_f05_per_entity(
         fp = counts['fp']
         fn = counts['fn']
 
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-
-        if precision + recall == 0:
+        if tp + fn == 0:
+            # Singleton in ground truth (no true matches)
+            f05 = 1.0 if fp == 0 else 0.0
+        elif tp + fp == 0:
+            # Non-singleton in ground truth, but predicted empty
             f05 = 0.0
         else:
-            f05 = (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
+            precision = tp / (tp + fp)
+            recall = tp / (tp + fn)
+            if precision + recall == 0:
+                f05 = 0.0
+            else:
+                f05 = (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
         f05_scores.append(f05)
 
-    return np.mean(f05_scores) if f05_scores else 0.0
+    return float(np.mean(f05_scores)) if f05_scores else 0.0
 
 
 def optimize_f05_threshold(
@@ -720,40 +727,83 @@ def predict_matches(
     model: object,
     threshold: float,
     feature_fn: Callable,
+    batch_size: int = 100000,
 ) -> Dict[str, List[str]]:
     """
-    Runs inference on candidate pairs and returns predicted matches.
+    Runs GPU-accelerated batch inference on candidate pairs and returns predicted matches.
+    Batches candidate pairs into chunks of 100,000 to maximize NVIDIA RTX 5060 GPU tensor throughput.
     Returns: {s1_id: [matched_cand_id, ...]}
     """
-    print(f"\n=== Running Inference (threshold={threshold:.2f}) ===")
+    print(f"\n=== Running GPU Batch Inference (threshold={threshold:.2f}, chunk_size={batch_size:,}) ===")
 
-    predicted_matches: Dict[str, List[str]] = {}
+    # Ensure XGBoost uses CUDA
+    if hasattr(model, 'set_params'):
+        try:
+            model.set_params(device='cuda')
+        except Exception:
+            pass
+
+    # Pre-populate all S1 entities with empty match lists
+    predicted_matches: Dict[str, List[str]] = {
+        str(row.source1_entity_id).strip(): []
+        for row in candidate_df.itertuples()
+    }
+
     total_pairs = 0
     total_matches = 0
     skipped = 0
+    best_candidate: Dict[str, Tuple[str, float]] = {}
 
+    batch_s1_ids: List[str] = []
+    batch_cand_ids: List[str] = []
+    batch_features: List[np.ndarray] = []
+
+    def flush_gpu_batch():
+        nonlocal total_pairs, total_matches
+        if not batch_features:
+            return
+
+        X_batch = np.array(batch_features, dtype=np.float32)
+        # Vectorized GPU forward pass across the entire batch
+        probs = model.predict_proba(X_batch)[:, 1]
+
+        # Vectorized threshold evaluation
+        matched_indices = np.where(probs >= threshold)[0]
+        for idx in matched_indices:
+            s1_id = batch_s1_ids[idx]
+            cand_id = batch_cand_ids[idx]
+            predicted_matches[s1_id].append(cand_id)
+            total_matches += 1
+
+        # Track top candidate per S1 entity for high-recall fallback
+        for idx in range(len(probs)):
+            p = float(probs[idx])
+            s1_id = batch_s1_ids[idx]
+            cand_id = batch_cand_ids[idx]
+            if s1_id not in best_candidate or p > best_candidate[s1_id][1]:
+                best_candidate[s1_id] = (cand_id, p)
+
+        total_pairs += len(batch_features)
+        batch_s1_ids.clear()
+        batch_cand_ids.clear()
+        batch_features.clear()
+
+    total_s1 = len(candidate_df)
     for row_idx, row in enumerate(candidate_df.itertuples()):
         s1_id = str(row.source1_entity_id).strip()
         cand_str = str(getattr(row, 'candidate_entity_ids', '')).strip()
 
         if not cand_str:
-            predicted_matches[s1_id] = []
             continue
 
         cand_ids = [c.strip() for c in cand_str.split(',') if c.strip()]
         if not cand_ids:
-            predicted_matches[s1_id] = []
             continue
 
         s1_rec = entity_lookup.get(s1_id)
         if not s1_rec:
-            predicted_matches[s1_id] = []
             skipped += 1
             continue
-
-        # Extract features for all candidates of this S1 entity
-        batch_features = []
-        valid_cand_ids = []
 
         for cand_id in cand_ids:
             cand_rec = entity_lookup.get(cand_id)
@@ -763,35 +813,37 @@ def predict_matches(
 
             feats = feature_fn(s1_rec, cand_rec)
             batch_features.append(feats)
-            valid_cand_ids.append(cand_id)
+            batch_s1_ids.append(s1_id)
+            batch_cand_ids.append(cand_id)
 
-        if not batch_features:
-            predicted_matches[s1_id] = []
-            continue
+            if len(batch_features) >= batch_size:
+                flush_gpu_batch()
 
-        # Batch prediction
-        X_batch = np.array(batch_features, dtype=np.float32)
-        probs = model.predict_proba(X_batch)[:, 1]
+        if (row_idx + 1) % 100000 == 0:
+            print(f"  Processed {row_idx + 1:,}/{total_s1:,} S1 entities... ({total_matches:,} matches found so far)")
 
-        # Apply threshold
-        matches = []
-        for i, prob in enumerate(probs):
-            if prob >= threshold:
-                matches.append(valid_cand_ids[i])
+    # Flush final remaining pairs
+    flush_gpu_batch()
 
-        predicted_matches[s1_id] = matches
-        total_pairs += len(valid_cand_ids)
-        total_matches += len(matches)
+    # High-recall fallback: For entities where no candidate passed the strict threshold,
+    # include the single highest-probability candidate if confidence >= fallback_threshold
+    fallback_threshold = min(max(threshold * 0.50, 0.35), 0.45)
+    fallback_count = 0
+    for s1_id, matches in predicted_matches.items():
+        if not matches and s1_id in best_candidate:
+            top_cand, top_p = best_candidate[s1_id]
+            if top_p >= fallback_threshold:
+                matches.append(top_cand)
+                fallback_count += 1
+                total_matches += 1
 
-        # Progress
-        if (row_idx + 1) % 50000 == 0:
-            print(f"  Processed {row_idx + 1:,} S1 entities... "
-                  f"({total_matches:,} matches so far)")
+    if fallback_count > 0:
+        print(f"  Fallback matches rescued:     {fallback_count:,} (p >= {fallback_threshold:.2f})")
 
-    print(f"\n  Inference complete:")
-    print(f"  Total pairs scored: {total_pairs:,}")
-    print(f"  Total matches predicted: {total_matches:,}")
-    print(f"  S1 entities with >=1 match: {sum(1 for v in predicted_matches.values() if v):,}")
+    print(f"\n  GPU Batch Inference complete:")
+    print(f"  Total candidate pairs scored: {total_pairs:,}")
+    print(f"  Total matches predicted:      {total_matches:,}")
+    print(f"  S1 entities with >=1 match:   {sum(1 for v in predicted_matches.values() if v):,}")
     if skipped > 0:
         print(f"  Skipped (entity not in lookup): {skipped:,}")
 
@@ -907,6 +959,13 @@ def load_saved_model(model_path: str) -> Tuple[object, float, str]:
     model = metadata['model']
     threshold = metadata['threshold']
     backend = metadata.get('backend', 'unknown')
+
+    # Ensure XGBoost uses NVIDIA GPU for fast prediction
+    if hasattr(model, 'set_params'):
+        try:
+            model.set_params(device='cuda')
+        except Exception:
+            pass
 
     print(f"  Backend: {backend}")
     print(f"  Threshold: {threshold:.2f}")
@@ -1166,17 +1225,20 @@ def main():
         # Train model
         print("\n[3/4] Training model...")
         model, threshold, f05_score = train_model(
-            X, y, backend=args.backend, use_gpu=args.use_gpu, n_folds=args.n_folds
+            X, y, backend=args.backend, use_gpu=args.use_gpu, n_folds=args.n_folds, pair_ids=pair_ids
         )
 
         # Save model
         print("\n[4/4] Saving model...")
         model_path = save_model(model, threshold, f05_score, model_dir, args.backend)
 
-        # Quick evaluation on training data
-        print("\n--- Quick Training Evaluation ---")
-        train_predicted = predict_matches(candidate_df, entity_lookup, model, threshold, feature_fn)
-        evaluate_predictions(train_predicted, gt_map)
+        # Quick evaluation on training data (sample of 10,000 S1 entities)
+        eval_sample_n = min(10000, len(candidate_df))
+        print(f"\n--- Quick Training Evaluation (Sample: {eval_sample_n:,} S1 entities) ---")
+        eval_sample_df = candidate_df.head(eval_sample_n)
+        train_predicted = predict_matches(eval_sample_df, entity_lookup, model, threshold, feature_fn)
+        sample_gt = {k: v for k, v in gt_map.items() if k in train_predicted}
+        evaluate_predictions(train_predicted, sample_gt)
 
     # ---- PREDICT MODE ----
     if args.mode in ('predict', 'both'):

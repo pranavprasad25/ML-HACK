@@ -22,6 +22,7 @@ Specifications:
 """
 
 import math
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -41,6 +42,12 @@ FEATURE_NAMES: List[str] = [
     "address_token_sort_ratio",
     "address_token_set_ratio",
     "exact_zip_match",
+    "exact_name_match",
+    "compact_name_match",
+    "street_number_match",
+    "name_token_jaccard",
+    "address_token_jaccard",
+    "is_source3",
 ]
 
 NUM_FEATURES: int = len(FEATURE_NAMES)
@@ -191,9 +198,40 @@ def extract_features(s1_rec: Dict[str, Any], cand_rec: Dict[str, Any]) -> np.nda
         feats[7] = fuzz.token_set_ratio(addr1, addr2) * 0.01
 
     # 4. Geographical Feature: Exact ZIP/PIN match
-    # Strict binary rule: 1.0 if both exist and match, 0.0 if mismatch or either is missing
     if zip1 and zip2 and zip1 == zip2:
         feats[8] = 1.0
+
+    # 5. Exact & Compact Name Match (handles domain names like strategicpraetorian com)
+    if name1 and name2:
+        if name1 == name2:
+            feats[9] = 1.0
+        c1 = re.sub(r'[^a-z0-9]', '', re.sub(r'\b(com|org|net|co\s*in|in|biz|info|io)\b', '', name1))
+        c2 = re.sub(r'[^a-z0-9]', '', re.sub(r'\b(com|org|net|co\s*in|in|biz|info|io)\b', '', name2))
+        if c1 and c2 and c1 == c2:
+            feats[10] = 1.0
+
+    # 6. Street Number Match (1.0 = match, -1.0 = conflict, 0.0 = missing)
+    if addr1 and addr2:
+        m1 = re.search(r'\b\d{1,6}\b', addr1)
+        m2 = re.search(r'\b\d{1,6}\b', addr2)
+        if m1 and m2:
+            feats[11] = 1.0 if m1.group(0) == m2.group(0) else -1.0
+
+    # 7. Token Jaccard Similarities
+    if name1 and name2:
+        t1, t2 = set(name1.split()), set(name2.split())
+        union_t = t1 | t2
+        feats[12] = (len(t1 & t2) / len(union_t)) if union_t else 0.0
+
+    if addr1 and addr2:
+        a1, a2 = set(addr1.split()), set(addr2.split())
+        union_a = a1 | a2
+        feats[13] = (len(a1 & a2) / len(union_a)) if union_a else 0.0
+
+    # 8. Source Flag
+    cand_id = str(cand_rec.get("entity_id", "") or "")
+    if cand_id.startswith("S3-"):
+        feats[14] = 1.0
 
     return feats
 

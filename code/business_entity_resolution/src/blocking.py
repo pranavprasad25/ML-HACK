@@ -10,7 +10,7 @@ This module filters millions of potential comparisons down to a high-recall cand
 import os
 import re
 import argparse
-from typing import Generator, Tuple, Dict, Set, List, Optional
+from typing import Generator, Tuple, Dict, Set, List, Optional, Any
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -53,110 +53,199 @@ def get_soundex(word: str) -> str:
 
 
 # ==========================================
-# 2. MULTI-KEY BLOCKING ENGINE
+# 2. MULTI-KEY BLOCKING ENGINE (BALANCED S2 & S3)
 # ==========================================
 
-def generate_candidates_for_country(
-    df_s1: pd.DataFrame, 
-    df_targets: pd.DataFrame, 
-    top_k: int = 30,
-    use_gpu: bool = False
+TLD_PATTERN = re.compile(r'\b(com|org|net|co\s*in|in|biz|info|io|gov)\b', re.IGNORECASE)
+STREET_NUM_PATTERN = re.compile(r'\b\d{1,6}\b')
+
+
+def extract_street_number(addr: str) -> str:
+    """Extracts first numerical street number from clean address."""
+    if not addr or not isinstance(addr, str):
+        return ""
+    m = STREET_NUM_PATTERN.search(addr)
+    return m.group(0) if m else ""
+
+
+def get_compact_name(name: str) -> str:
+    """Strips common domain extensions and spaces to match domain-style company names."""
+    if not name or not isinstance(name, str):
+        return ""
+    stripped = TLD_PATTERN.sub('', name.lower())
+    compact = re.sub(r'[^a-z0-9]', '', stripped)
+    return compact[:10] if len(compact) >= 5 else ""
+
+
+def build_source_index(df_target: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Builds high-recall inverted index structures for a specific target source (S2 or S3).
+    Includes:
+      1. Exact Clean Name
+      2. Compact Domain Name Prefix (squashed spaces & TLD stripped)
+      3. Joint 2-Token Key (order invariant)
+      4. Compound Postal + Token
+      5. Street Number + Token
+      6. Significant Name Tokens (length >= 3)
+      7. Phonetic Soundex
+    """
+    target_ids = df_target['entity_id'].values
+
+    exact_name_idx: Dict[str, List[int]] = {}
+    compact_name_idx: Dict[str, List[int]] = {}
+    pair_tok_idx: Dict[str, List[int]] = {}
+    compound_postal_idx: Dict[str, List[int]] = {}
+    street_num_idx: Dict[str, List[int]] = {}
+    word_idx: Dict[str, List[int]] = {}
+    soundex_idx: Dict[str, List[int]] = {}
+
+    for idx, row in enumerate(df_target.itertuples()):
+        name = str(getattr(row, 'business_name_clean', '') or '').strip()
+        addr = str(getattr(row, 'business_address_clean', '') or '').strip()
+        postal = str(getattr(row, 'postal_code', '') or '').strip()
+        tokens = str(getattr(row, 'name_tokens', '') or name).split()
+        sig_tokens = sorted([w for w in set(tokens) if len(w) >= 3])
+        s_num = extract_street_number(addr)
+
+        if name:
+            exact_name_idx.setdefault(name, []).append(idx)
+
+        comp = get_compact_name(name)
+        if comp:
+            compact_name_idx.setdefault(comp, []).append(idx)
+
+        # 2-token joint key (sorted so word order doesn't matter)
+        for i in range(len(sig_tokens)):
+            for j in range(i + 1, min(i + 4, len(sig_tokens))):
+                pair_tok_idx.setdefault(f"{sig_tokens[i]}_{sig_tokens[j]}", []).append(idx)
+
+        for w in sig_tokens:
+            word_idx.setdefault(w, []).append(idx)
+            if postal:
+                compound_postal_idx.setdefault(f"{postal}_{w}", []).append(idx)
+            if s_num:
+                street_num_idx.setdefault(f"{s_num}_{w}", []).append(idx)
+            sx = get_soundex(w)
+            if sx:
+                soundex_idx.setdefault(sx, []).append(idx)
+
+    index_bundle = {
+        'exact': exact_name_idx,
+        'compact': compact_name_idx,
+        'pairs': pair_tok_idx,
+        'compound': compound_postal_idx,
+        'street': street_num_idx,
+        'words': word_idx,
+        'soundex': soundex_idx,
+    }
+    return target_ids, index_bundle
+
+
+def retrieve_candidates_from_source(
+    s1_row: Any,
+    target_ids: np.ndarray,
+    index: Dict[str, Any],
+    max_cands: int = 20,
+) -> Set[str]:
+    """Retrieves top candidates from a single target source using multi-key matching."""
+    s1_id = str(s1_row.entity_id).strip()
+    name = str(getattr(s1_row, 'business_name_clean', '') or '').strip()
+    addr = str(getattr(s1_row, 'business_address_clean', '') or '').strip()
+    postal = str(getattr(s1_row, 'postal_code', '') or '').strip()
+    tokens = str(getattr(s1_row, 'name_tokens', '') or name).split()
+    sig_tokens = sorted([w for w in set(tokens) if len(w) >= 3])
+    s_num = extract_street_number(addr)
+    comp = get_compact_name(name)
+
+    cands: Set[str] = set()
+
+    # 1. Exact clean name (highest signal)
+    if name:
+        for tidx in index['exact'].get(name, [])[:15]:
+            cands.add(target_ids[tidx])
+
+    # 2. Compact domain name prefix
+    if comp:
+        for tidx in index['compact'].get(comp, [])[:15]:
+            cands.add(target_ids[tidx])
+
+    # 3. Two-token joint pair match (catches word order swaps)
+    for i in range(len(sig_tokens)):
+        for j in range(i + 1, min(i + 4, len(sig_tokens))):
+            for tidx in index['pairs'].get(f"{sig_tokens[i]}_{sig_tokens[j]}", [])[:10]:
+                cands.add(target_ids[tidx])
+                if len(cands) >= max_cands:
+                    break
+
+    # 4. Compound postal + token
+    if postal and len(cands) < max_cands:
+        for w in sig_tokens:
+            for tidx in index['compound'].get(f"{postal}_{w}", [])[:10]:
+                cands.add(target_ids[tidx])
+
+    # 5. Street number + token
+    if s_num and len(cands) < max_cands:
+        for w in sig_tokens:
+            for tidx in index['street'].get(f"{s_num}_{w}", [])[:10]:
+                cands.add(target_ids[tidx])
+
+    # 6. Rare words (sorted by target frequency ascending)
+    if len(cands) < max_cands:
+        sorted_tokens = sorted(sig_tokens, key=lambda w: len(index['words'].get(w, [])))
+        for w in sorted_tokens:
+            hits = index['words'].get(w, [])
+            if hits:
+                for tidx in hits[:15]:
+                    cands.add(target_ids[tidx])
+                if len(cands) >= max_cands:
+                    break
+
+    # 7. Phonetic Soundex fallback
+    if len(cands) < 10:
+        for w in sig_tokens[:2]:
+            sx = get_soundex(w)
+            if sx:
+                for tidx in index['soundex'].get(sx, [])[:5]:
+                    cands.add(target_ids[tidx])
+
+    return {c for c in cands if c != s1_id}
+
+
+def generate_candidates_for_country_balanced(
+    df_s1: pd.DataFrame,
+    df_s2: pd.DataFrame,
+    df_s3: pd.DataFrame,
+    top_k: int = 40,
 ) -> Dict[str, Set[str]]:
     """
-    Generates high-recall candidate target IDs (S2/S3) for each S1 entity in a country partition.
-    Uses multi-threaded parallel queries across all CPU cores with multi-key inverted indexing:
-      1. Compound Rule: Exact Postal Code + Name Token match
-      2. Significant Word Rule: Name tokens (length >= 3)
-      3. Exact Postal Rule: Exact Postal Code match
-      4. Phonetic Rule: Soundex code on leading tokens
-      5. Prefix Rule: 3-character prefix match
+    Generates balanced high-recall candidates for each S1 entity in a country partition.
+    Allocates candidates evenly between Source 2 and Source 3 (e.g. top 20 from S2, top 20 from S3).
     """
     s1_candidates: Dict[str, Set[str]] = {str(s1_id).strip(): set() for s1_id in df_s1['entity_id']}
-    
-    if len(df_s1) == 0 or len(df_targets) == 0:
+
+    if len(df_s1) == 0:
         return s1_candidates
 
-    target_ids = df_targets['entity_id'].values
+    per_source_k = max(top_k // 2, 15)
 
-    print(f"  [1/2] Indexing {len(df_targets):,} target entities...")
-    postal_index: Dict[str, List[int]] = {}
-    word_index: Dict[str, List[int]] = {}
-    compound_index: Dict[str, List[int]] = {}
-    soundex_index: Dict[str, List[int]] = {}
-    prefix_index: Dict[str, List[int]] = {}
+    print(f"  [1/3] Indexing Source 2 ({len(df_s2):,} records)...")
+    s2_ids, s2_index = build_source_index(df_s2) if len(df_s2) > 0 else (np.array([]), {})
 
-    for idx, row in enumerate(df_targets.itertuples()):
-        postal = str(getattr(row, 'postal_code', '') or '').strip()
-        tokens = str(getattr(row, 'name_tokens', '') or getattr(row, 'business_name_clean', '') or '').split()
+    print(f"  [2/3] Indexing Source 3 ({len(df_s3):,} records)...")
+    s3_ids, s3_index = build_source_index(df_s3) if len(df_s3) > 0 else (np.array([]), {})
 
-        if postal:
-            postal_index.setdefault(postal, []).append(idx)
-
-        for w in tokens[:4]:
-            if len(w) >= 3:
-                word_index.setdefault(w, []).append(idx)
-                if postal:
-                    compound_index.setdefault(f"{postal}_{w}", []).append(idx)
-                sx = get_soundex(w)
-                if sx:
-                    soundex_index.setdefault(sx, []).append(idx)
-                prefix_index.setdefault(w[:3], []).append(idx)
-
-    print(f"  [2/2] Parallel candidate retrieval for {len(df_s1):,} S1 entities...")
+    print(f"  [3/3] Parallel candidate retrieval for {len(df_s1):,} S1 entities (S2 & S3 balanced)...")
     s1_rows = list(df_s1.itertuples())
 
     def process_s1_batch(batch):
         batch_res = {}
         for s1_row in batch:
             s1_id = str(s1_row.entity_id).strip()
-            postal = str(getattr(s1_row, 'postal_code', '') or '').strip()
-            tokens = str(getattr(s1_row, 'name_tokens', '') or getattr(s1_row, 'business_name_clean', '') or '').split()
-            cands = set()
-
-            # 1. Compound Rule: Postal + Word exact match (highest precision)
-            if postal:
-                for w in tokens[:4]:
-                    for tidx in compound_index.get(f"{postal}_{w}", [])[:20]:
-                        cands.add(target_ids[tidx])
-                        if len(cands) >= top_k:
-                            break
-
-            # 2. Significant word matches (length >= 3)
-            if len(cands) < top_k:
-                for w in tokens[:3]:
-                    if len(w) >= 3:
-                        for tidx in word_index.get(w, [])[:15]:
-                            cands.add(target_ids[tidx])
-                            if len(cands) >= top_k:
-                                break
-
-            # 3. Exact Postal Code match
-            if postal and len(cands) < top_k:
-                for tidx in postal_index.get(postal, [])[:10]:
-                    cands.add(target_ids[tidx])
-                    if len(cands) >= top_k:
-                        break
-
-            # 4. Phonetic Soundex match
-            if len(cands) < 15:
-                for w in tokens[:2]:
-                    sx = get_soundex(w)
-                    if sx:
-                        for tidx in soundex_index.get(sx, [])[:5]:
-                            cands.add(target_ids[tidx])
-
-            # 5. Prefix 3 match
-            if len(cands) < 10:
-                for w in tokens[:2]:
-                    if len(w) >= 3:
-                        for tidx in prefix_index.get(w[:3], [])[:5]:
-                            cands.add(target_ids[tidx])
-
-            valid = {c for c in cands if c.startswith(('S2-', 'S3-')) and c != s1_id}
-            batch_res[s1_id] = valid
+            cands_s2 = retrieve_candidates_from_source(s1_row, s2_ids, s2_index, max_cands=per_source_k) if len(s2_ids) > 0 else set()
+            cands_s3 = retrieve_candidates_from_source(s1_row, s3_ids, s3_index, max_cands=per_source_k) if len(s3_ids) > 0 else set()
+            batch_res[s1_id] = cands_s2 | cands_s3
         return batch_res
 
-    # Multi-threaded querying across all cores
     from concurrent.futures import ThreadPoolExecutor
     workers = min(os.cpu_count() or 4, 16)
     chunk_size = (len(s1_rows) + workers - 1) // workers
@@ -175,39 +264,38 @@ def generate_candidate_pairs(
     df_s1: pd.DataFrame, 
     df_s2: pd.DataFrame, 
     df_s3: pd.DataFrame, 
-    top_k: int = 30,
+    top_k: int = 40,
     use_gpu: bool = False
 ) -> pd.DataFrame:
     """
-    Executes country-partitioned multi-key blocking across S1, S2, and S3.
-    Ensures strict formatting rules enforced by validate_submission.py.
+    Executes country-partitioned balanced multi-key blocking across S1, S2, and S3.
+    Guarantees that neither Source 2 nor Source 3 is starved out.
     """
-    df_targets = pd.concat([df_s2, df_s3], ignore_index=True)
-
-    if 'country' not in df_s1.columns:
-        df_s1['country'] = 'UNKNOWN'
-    if 'country' not in df_targets.columns:
-        df_targets['country'] = 'UNKNOWN'
+    for df in (df_s1, df_s2, df_s3):
+        if 'country' not in df.columns:
+            df['country'] = 'UNKNOWN'
 
     countries = df_s1['country'].astype(str).str.upper().unique()
     all_candidate_map: Dict[str, Set[str]] = {}
 
     for c in countries:
         sub_s1 = df_s1[df_s1['country'].astype(str).str.upper() == c]
-        sub_target = df_targets[df_targets['country'].astype(str).str.upper() == c]
+        sub_s2 = df_s2[df_s2['country'].astype(str).str.upper() == c]
+        sub_s3 = df_s3[df_s3['country'].astype(str).str.upper() == c]
 
-        if len(sub_target) == 0:
-            sub_target = df_targets
+        if len(sub_s2) == 0:
+            sub_s2 = df_s2
+        if len(sub_s3) == 0:
+            sub_s3 = df_s3
 
-        print(f"Blocking country '{c}': {len(sub_s1):,} S1 entities against {len(sub_target):,} target entities...")
-        country_candidates = generate_candidates_for_country(sub_s1, sub_target, top_k=top_k, use_gpu=use_gpu)
+        print(f"\nBlocking country '{c}': {len(sub_s1):,} S1 vs ({len(sub_s2):,} S2, {len(sub_s3):,} S3)...")
+        country_candidates = generate_candidates_for_country_balanced(sub_s1, sub_s2, sub_s3, top_k=top_k)
         all_candidate_map.update(country_candidates)
 
     rows = []
     for s1_id in df_s1['entity_id']:
         s1_id_str = str(s1_id).strip()
         cand_set = all_candidate_map.get(s1_id_str, set())
-        # Filter strictly S2- and S3- prefixed IDs, drop self matches, sort deterministically
         valid_cands = sorted([cid for cid in cand_set if cid.startswith(('S2-', 'S3-')) and cid != s1_id_str])
         rows.append({
             'source1_entity_id': s1_id_str,
@@ -220,6 +308,7 @@ def generate_candidate_pairs(
 
 # Alias for pipeline compatibility
 generate_candidates_by_country = generate_candidate_pairs
+generate_candidates_for_country = generate_candidate_pairs
 
 
 # ==========================================
