@@ -235,7 +235,7 @@ You submit predictions for the full test set in both cases; the split is applied
 
    A template for this documentation is provided in `Documentation_template.md`. There is no page limit — prioritise clarity and technical depth over brevity.
 
-### **Academic Integrity and Fair Play:**
+### **Academic Integrity and Fair Play**
 
 ** STRICTLY PROHIBITED: External Data Lookup**
 
