@@ -237,7 +237,7 @@ You submit predictions for the full test set in both cases; the split is applied
 
 ### **Academic Integrity and Fair Play:**
 
-**⚠️ STRICTLY PROHIBITED: External Data Lookup**
+** STRICTLY PROHIBITED: External Data Lookup**
 
 Participants are **STRICTLY NOT ALLOWED** to use external databases, APIs, or services to look up business identities or resolve entities. This includes but is not limited to:
 
